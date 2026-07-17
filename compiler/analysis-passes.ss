@@ -4652,6 +4652,204 @@
        (process-function-name! function-name)
        ir]))
 
+  (define-pass reject-constructor-effects : Lnodca (ir) -> Lnodca ()
+    ; this pass raises an exception if the constructor performs (directly or
+    ; indirectly) any operation that produces a transaction-level effect
+    ; (minting/sending/receiving/burning tokens or coins, Zswap coin ops).  A
+    ; ContractDeploy carries no effects transcript and the ledger rejects a
+    ; deploy whose initial state has any non-zero balance, so such effects are
+    ; structurally dropped -- we reject them at compile time instead.
+    ;
+    ; Modeled on reject-constructor-cc-calls: a call-graph reachability walk.
+    ; The forbidden leaves are the Kernel ADT update operations (matched by the
+    ; ledger-op name on a public-ledger accessor) and the two Zswap native
+    ; entries (matched by native-entry-function).  We deliberately do NOT match
+    ; stdlib helper circuit names (mintShieldedToken, send, ...): reachability
+    ; through their bodies catches them for free, and also catches user-written
+    ; wrappers.
+    (definitions
+      (define-condition-type &effect-condition &condition
+        make-effect-condition effect-condition?
+        (function-name effect-condition-function-name)
+        (src effect-condition-src)
+        (op effect-condition-op))
+      ; Kernel update operations that emit a transaction-level effect
+      (define forbidden-kernel-ops
+        '(mintShielded mintUnshielded
+          claimZswapCoinReceive claimZswapCoinSpend claimZswapNullifier
+          claimUnshieldedCoinSpend incUnshieldedInputs incUnshieldedOutputs
+          claimContractCall checkpoint))
+      ; native entries that create Zswap coin inputs/outputs
+      (define forbidden-native-functions
+        '("__compactRuntime.createZswapInput" "__compactRuntime.createZswapOutput"))
+      ; function-ht maps ids (circuit/native names) to one of:
+      ;   an Lnodca Expression:  a circuit that has yet to be processed
+      ;   inprocess-circuit:     a circuit that is being processed; used to detect cycles
+      ;   forbidden-native:      a native entry that itself produces an effect
+      ;   #f:                    a processed circuit, determined not to produce any effect
+      ;   an effect condition:   a processed circuit, determined to produce at least one effect
+      (define function-ht (make-eq-hashtable))
+      (define (process-circuit! a)
+        (let ([function-name (car a)] [maybe-expr (cdr a)])
+          (when (Lnodca-Expression? maybe-expr)
+            (guard (c [(effect-condition? c) (set-cdr! a c)]
+                      [else (raise-continuable c)])
+              (set-cdr! a 'inprocess-circuit)
+              (Expression maybe-expr function-name)
+              (set-cdr! a #f)))))
+      (define (process-function-name! current-function-name src function-name)
+        (let ([a (eq-hashtable-cell function-ht function-name #f)])
+          (when (eq? (cdr a) 'forbidden-native)
+            (raise (make-effect-condition current-function-name src (id-sym function-name))))
+          (process-circuit! a)
+          (let ([result (cdr a)])
+            (assert (not (eq? result 'inprocess-circuit)))
+            (when (effect-condition? result)
+              (raise-continuable result)))))
+    )
+    (Program : Program (ir) -> Program ()
+      [(program ,src (,contract-type* ...) ((,struct-name* ,[type*]) ...) ((,export-name* ,name*) ...) ,pelt* ...)
+       (for-each record-function-kind! pelt*)
+       (for-each Program-Element pelt*)
+       ir])
+    (record-function-kind! : Program-Element (ir) -> * (void)
+      [(circuit ,src ,function-name (,arg* ...) ,type ,expr)
+       (eq-hashtable-set! function-ht function-name expr)]
+      [(native ,src ,function-name ,native-entry (,arg* ...) ,type)
+       (when (member (native-entry-function native-entry) forbidden-native-functions)
+         (eq-hashtable-set! function-ht function-name 'forbidden-native))]
+      [else (void)])
+    (Program-Element : Program-Element (ir) -> Program-Element ()
+      [(circuit ,src ,function-name (,arg* ...) ,type ,expr)
+       (process-circuit! (eq-hashtable-cell function-ht function-name #f))
+       ir])
+    (Ledger-Constructor : Ledger-Constructor (ir) -> Ledger-Constructor ()
+      [(constructor ,src (,arg* ... ) ,expr)
+       (let ([a (cons #f expr)])
+         (process-circuit! a)
+         (let ([result (cdr a)])
+           (when (effect-condition? result)
+             (let ([offending-function-name (effect-condition-function-name result)]
+                   [op (effect-condition-op result)]
+                   [csrc (effect-condition-src result)])
+               (cond
+                 ; level 1 -- the built-in is invoked directly in the constructor body,
+                 ; so point the error straight at it rather than at the constructor
+                 [(eq? offending-function-name #f)
+                  (source-errorf csrc "constructor cannot perform the unpermitted built-in operation \"~a\"" op)]
+                 ; level 2 -- reached through a user-defined circuit
+                 [(not (stdlib-src? csrc))
+                  (source-errorf src "usage of the circuit \"~a\" performs the unpermitted built-in operation \"~a\" at ~a"
+                                 (id-sym offending-function-name) op (format-source-object csrc))]
+                 ; level 3 -- reached through a standard library operation
+                 [else
+                  (source-errorf src "usage of the standard library operation \"~a\" performs the unpermitted built-in operation \"~a\" at ~a"
+                                 (id-sym offending-function-name) op (format-source-object csrc))])))))
+       ir])
+    (Expression : Expression (ir function-name) -> Expression ()
+      [(public-ledger ,src ,ledger-field-name ,sugar? ,[accessor*] ...)
+       (for-each
+         (lambda (accessor)
+           (nanopass-case (Lnodca Ledger-Accessor) accessor
+             [(,src^ ,ledger-op ,expr* ...)
+              ; kernel ADT ops are written "kernel.<op>" in source; show them that way
+              (when (memq ledger-op forbidden-kernel-ops)
+                (raise (make-effect-condition function-name src^ (format "kernel.~a" ledger-op))))]))
+         accessor*)
+       ir]
+      [(call ,src ,function-name^ ,[expr*] ...)
+       (process-function-name! function-name src function-name^)
+       ir])
+    (Ledger-Accessor : Ledger-Accessor (ir function-name) -> Ledger-Accessor ())
+    (Function : Function (ir function-name) -> Function ()
+      [(fref ,src ,function-name^)
+       (process-function-name! function-name src function-name^)
+       ir]))
+
+  (define-pass reject-constructor-self : Lnodca (ir) -> Lnodca ()
+    ; this pass raises an exception if the constructor reads the contract's own
+    ; address via kernel.self (directly or indirectly).  This is not an effect,
+    ; but a contract's address is a hash of its initial state, so kernel.self()
+    ; returns the zero ContractAddress during construction -- silently wrong for
+    ; any address-dependent logic.  Kept separate from the effect check with a
+    ; distinct diagnostic.  (For the prototype this is an error; a warning would
+    ; be a defensible softening.)
+    (definitions
+      (define-condition-type &self-condition &condition
+        make-self-condition self-condition?
+        (function-name self-condition-function-name)
+        (src self-condition-src))
+      (define function-ht (make-eq-hashtable))
+      (define (process-circuit! a)
+        (let ([function-name (car a)] [maybe-expr (cdr a)])
+          (when (Lnodca-Expression? maybe-expr)
+            (guard (c [(self-condition? c) (set-cdr! a c)]
+                      [else (raise-continuable c)])
+              (set-cdr! a 'inprocess-circuit)
+              (Expression maybe-expr function-name)
+              (set-cdr! a #f)))))
+      (define (process-function-name! function-name)
+        (let ([a (eq-hashtable-cell function-ht function-name #f)])
+          (process-circuit! a)
+          (let ([result (cdr a)])
+            (assert (not (eq? result 'inprocess-circuit)))
+            (when (self-condition? result)
+              (raise-continuable result)))))
+    )
+    (Program : Program (ir) -> Program ()
+      [(program ,src (,contract-type* ...) ((,struct-name* ,[type*]) ...) ((,export-name* ,name*) ...) ,pelt* ...)
+       (for-each record-function-kind! pelt*)
+       (for-each Program-Element pelt*)
+       ir])
+    (record-function-kind! : Program-Element (ir) -> * (void)
+      [(circuit ,src ,function-name (,arg* ...) ,type ,expr)
+       (eq-hashtable-set! function-ht function-name expr)]
+      [else (void)])
+    (Program-Element : Program-Element (ir) -> Program-Element ()
+      [(circuit ,src ,function-name (,arg* ...) ,type ,expr)
+       (process-circuit! (eq-hashtable-cell function-ht function-name #f))
+       ir])
+    (Ledger-Constructor : Ledger-Constructor (ir) -> Ledger-Constructor ()
+      [(constructor ,src (,arg* ... ) ,expr)
+       (let ([a (cons #f expr)])
+         (process-circuit! a)
+         (let ([result (cdr a)])
+           (when (self-condition? result)
+             (let ([offending-function-name (self-condition-function-name result)]
+                   [csrc (self-condition-src result)])
+               (cond
+                 ; level 1 -- kernel.self read directly in the constructor body,
+                 ; so point the error straight at it rather than at the constructor
+                 [(eq? offending-function-name #f)
+                  (source-errorf csrc "constructor cannot use the built-in operation \"kernel.self\"")]
+                 ; level 2 -- reached through a user-defined circuit
+                 [(not (stdlib-src? csrc))
+                  (source-errorf src "usage of the circuit \"~a\" reads the built-in operation \"kernel.self\" at ~a"
+                                 (id-sym offending-function-name) (format-source-object csrc))]
+                 ; level 3 -- reached through a standard library operation
+                 [else
+                  (source-errorf src "usage of the standard library operation \"~a\" reads the built-in operation \"kernel.self\" at ~a"
+                                 (id-sym offending-function-name) (format-source-object csrc))])))))
+       ir])
+    (Expression : Expression (ir function-name) -> Expression ()
+      [(public-ledger ,src ,ledger-field-name ,sugar? ,[accessor*] ...)
+       (for-each
+         (lambda (accessor)
+           (nanopass-case (Lnodca Ledger-Accessor) accessor
+             [(,src^ ,ledger-op ,expr* ...)
+              (when (eq? ledger-op 'self)
+                (raise (make-self-condition function-name src^)))]))
+         accessor*)
+       ir]
+      [(call ,src ,function-name^ ,[expr*] ...)
+       (process-function-name! function-name^)
+       ir])
+    (Ledger-Accessor : Ledger-Accessor (ir function-name) -> Ledger-Accessor ())
+    (Function : Function (ir function-name) -> Function ()
+      [(fref ,src ,function-name)
+       (process-function-name! function-name)
+       ir]))
+
   (define-pass identify-pure-circuits : Lnodca (ir) -> Lnodca ()
     ; impure circuits are those that might touch public state, emit an event,
     ; call any witnesses, or call any other impure circuits (including via
@@ -6260,6 +6458,8 @@
     (check-sealed-fields             Lnodca)
     (reject-constructor-emit         Lnodca)
     (reject-constructor-cc-calls     Lnodca)
+    (reject-constructor-effects      Lnodca)
+    (reject-constructor-self         Lnodca)
     (identify-pure-circuits          Lnodca)
     (determine-ledger-paths          Lwithpaths0)
     (propagate-ledger-paths          Lwithpaths)
