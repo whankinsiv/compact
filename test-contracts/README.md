@@ -139,3 +139,61 @@ protection is owned by Vitest and CI through `testTimeout` in
 `vitest.config.ts`. `yarn lint` prepares generated imports with `--skip-zk`;
 `yarn test` uses full compiler runs so compile tests still cover proving-key
 generation.
+
+## Language Coverage
+
+`./test-contracts/go` measures how much of the compiler these fixtures exercise.
+It is the fixture-suite counterpart of `./compiler/go` and works the same way:
+build the compiler with Chez profiling on, push something through it, then read
+the profile back. The only differences are the driver — fixture files on disk
+rather than the tests inlined in `compiler/test.ss` — and the directory the
+report lands in.
+
+```sh
+nix develop .#compiler --command ./test-contracts/go
+```
+
+Or as part of a suite run, which does both in one command:
+
+```sh
+./test-contracts/test.sh --coverage
+```
+
+It stays opt-in rather than folded into `test.sh` unconditionally, because it
+needs `obj/profiled-compiler` — a from-source Chez build of the compiler with
+profiling enabled — which the suite proper does not: that uses the packaged
+`compactc` straight from the Nix cache. The two also answer different questions.
+`test.sh` is the gate: do the fixtures behave as their file names say. Coverage
+is a report.
+
+Output is `test-contracts/coverage/`, in the same shape as the `coverage/`
+that `compiler/go` writes: the per-file line-coloured dump `profile-dump-html` produces, plus
+a summary line in the same form `compiler/go` prints.
+
+```text
+====================== START OF FIXTURE TESTS =====================
+found 101 fixtures under test-contracts/primitives
+101 of 101 fixtures produced their expected compile result
+======== END OF FIXTURE TESTS. COVERAGE = 45% (33491/74503). ========
+```
+
+Read the number the way you read the compiler's own: it counts profiled source
+blocks under `compiler/`, a block covered when it ran at least once. Expect it
+far below `compiler/go`'s, and not because the fixtures are weak — the
+denominator is the whole compiler, including the formatter, the fixup tool, zkir
+emission, source maps and every error path, most of which no well-formed
+contract reaches. What it is good for is the same thing `coverage/` is good for:
+opening the dump and seeing which lines of the front end are cold.
+
+The fixtures are also checked as they are compiled — a fixture must fail only if
+a `compile.fail.test.ts` sits beside it — so a non-zero exit means a fixture
+behaved unexpectedly, exactly as `compiler/go` exits non-zero on a failed unit
+test.
+
+CI runs it inside the compiler workflow rather than this one. `build-compiler.yml`
+already builds a profiled compiler for `./compiler/go`, so running
+`./test-contracts/go` straight afterwards reuses those objects and costs only
+the fixture compiles; the report is uploaded as a build artifact alongside the
+compiler's own. Nothing gates on the number — a percentage would ratchet down
+every time the language grows a production, for reasons unrelated to the
+fixtures. The report is there to be read.

@@ -19,12 +19,33 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# --coverage additionally measures how much of the Compact language the fixtures
+# exercise. It is opt-in because it needs obj/profiled-compiler -- a from-source
+# build of the compiler with Chez profiling enabled -- which the suite proper
+# does not, using the packaged compactc instead. See ./test-contracts/go.
+coverage=false
+filters=()
+
+for arg in "$@"; do
+  if [ "$arg" = "--coverage" ]; then
+    coverage=true
+  else
+    filters+=("$arg")
+  fi
+done
+
 nix develop --no-warn-dirty .#test-contracts --command bash -c '
   set -euo pipefail
+  coverage="$1"
+  shift
   cd test-contracts
   ln -sfn "${COMPACT_RUNTIME_PKG:-../runtime}" .compact-runtime
   export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
   corepack yarn install --immutable
   COMPACT_BINARY=compactc corepack yarn lint
   COMPACT_BINARY=compactc corepack yarn test "$@"
-' bash "$@"
+  if [ "$coverage" = true ]; then
+    cd ..
+    ./test-contracts/go
+  fi
+' bash "$coverage" ${filters[@]+"${filters[@]}"}

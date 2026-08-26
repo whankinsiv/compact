@@ -215,6 +215,14 @@ jobs:
           nix develop --command ./srcMaps/test.sh
           test -d coverage
 
+      - name: Measure test-contracts coverage
+        run: |
+          if ! nix develop --command ./test-contracts/go; then
+            echo "::error::./test-contracts/go failed. Reproduce with 'nix develop .#compiler --command ./test-contracts/go'."
+            exit 1
+          fi
+          test -d test-contracts/coverage
+
       - name: Check doc/compact-reference.mdx is consistent with compiler/go
         run: |
           FAILED=0
@@ -273,12 +281,20 @@ jobs:
         run: |
           mv coverage coverage_$(date +"%Y%m%d%H%M%S")
           zip -r compiler-coverage.zip coverage*
+          mv test-contracts/coverage test-contracts/coverage_$(date +"%Y%m%d%H%M%S")
+          zip -r fixture-coverage.zip test-contracts/coverage*
 
       - name: Upload Artifact - coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Coverage Report
           path: compiler-coverage.zip
+
+      - name: Upload Artifact - Compact test-contracts coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Compact Language Coverage
+          path: fixture-coverage.zip
 
       - name: Test E2E
         run: |

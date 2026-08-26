@@ -1,0 +1,176 @@
+#! /usr/bin/env bash
+
+# This file is part of Compact.
+# Copyright (C) 2025 Midnight Foundation
+# SPDX-License-Identifier: Apache-2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# 	http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ./compiler/go measures how much of the compiler its own unit tests exercise.
+# This measures the same thing for the test-contracts fixtures, the same way and
+# with the same output: build the compiler with Chez profiling on, push the
+# fixtures through it in process, then read the profile back.
+#
+# The only differences from ./compiler/go are the driver -- fixture files on disk
+# rather than the tests inlined in compiler/test.ss -- and the directory the
+# report lands in.
+#
+# Run it from the repository root inside a nix shell:
+#
+#   nix develop .#compiler --command ./test-contracts/go
+
+set -o errexit
+set -o nounset
+
+# on macos chez scheme is usually available as chez on linux as scheme
+if command -v scheme &> /dev/null
+then
+   SCHEME=scheme
+else
+   SCHEME=chez
+fi
+
+if [ $# == 1 ]
+then
+  if [ "$1" == "--help" ]
+  then
+    program=`basename $0`
+    echo "usage: $program               # recompile compiler as needed, then measure coverage"
+    echo "       $program --rebuild     # recompile entire compiler, then measure coverage"
+    echo "       $program --help        # show this message"
+    echo "   NB: use --rebuild for complete coverage info"
+    exit
+  elif [ "$1" == "--rebuild" ]
+  then
+    rm -rf obj/profiled-compiler
+  else
+    exec $0 --help
+  fi
+fi
+
+rm -rf test-contracts/coverage
+mkdir test-contracts/coverage
+
+# enable profiling only for portions # of the code exercised by the compiler
+# proper, effectively excluding, e.g., all of the nanopass infrastructure
+# except macro-generated forms.
+"$SCHEME" -q << END || exit
+(reset-handler abort)
+(keyboard-interrupt-handler (lambda () (reset)))
+(print-extended-identifiers #t)
+(library-directories
+  ; redirect compiler object code to obj/profiled-compiler, leaving obj/compiler
+  ; for unprofiled code produced by compiling compiler/compactc.ss
+  (let f ([a* (library-directories)])
+    (assert (not (null? a*)))
+    (let ([a (car a*)] [a* (cdr a*)])
+      (if (equal? a '("compiler" . "obj/compiler"))
+          (cons '("compiler" . "obj/profiled-compiler") a*)
+          (cons a (f a*))))))
+(compile-library-handler
+  ; enable profiling for and only for code redirected to obj/profiled-compiler
+  (lambda (src-path obj-path)
+    (parameterize ([compile-profile
+                    (and (string=? (path-first obj-path) "obj")
+                         (string=? (path-first (path-rest obj-path)) "profiled-compiler"))])
+      (when (compile-profile)
+        (printf "compiling w/profiling ~a to ~a\n" src-path obj-path))
+      (compile-library src-path obj-path))))
+(compile-imported-libraries #t)
+(debug-level 3)
+(library (go)
+  (export failed)
+  (import (chezscheme))
+  ; failed is set upon failure to #t by the fixture loop below
+  (define failed (make-parameter #f)))
+(printf "====================== START OF FIXTURE TESTS =====================\n")
+(let ()
+  (import (except (chezscheme) errorf) (langs) (passes) (config-params) (utils) (go))
+
+  (define fixture-root "test-contracts/primitives")
+  (define scratch-dir "test-contracts/coverage/build")
+
+  (define (ends-with? str suffix)
+    (let ([n (string-length str)] [m (string-length suffix)])
+      (and (>= n m)
+           (let loop ([i 0])
+             (or (= i m)
+                 (and (char=? (string-ref str (+ (- n m) i)) (string-ref suffix i))
+                      (loop (+ i 1))))))))
+
+  ; A fixture is a directory holding exactly one .compact file.  Its expected
+  ; outcome is visible in the file names, exactly as the Vitest orchestrator
+  ; reads it: a compile.fail.test.ts sibling means the compile must fail.
+  (define (find-fixtures root)
+    (let ([acc '()])
+      (let walk ([dir root])
+        (let* ([names (sort string<? (directory-list dir))]
+               [expect-failure? (and (member "compile.fail.test.ts" names) #t)])
+          (for-each
+            (lambda (name)
+              (let ([path (string-append dir "/" name)])
+                (cond
+                  [(file-directory? path) (walk path)]
+                  [(ends-with? name ".compact")
+                   (set! acc (cons (cons path expect-failure?) acc))]
+                  [else (void)])))
+            names)))
+      (sort (lambda (a b) (string<? (car a) (car b))) acc)))
+
+  ; Warnings are collected and ignored the way compiler/test.ss collects them;
+  ; errors are caught, because a fixture that is meant to fail still exercised
+  ; the compiler up to the failing pass.
+  (define (compiles? source target)
+    (unregister-pathnames!)
+    (register-source-root! (path-parent source))
+    (rm-rf target)
+    (mkdir-p target)
+    (parameterize ([id-counter 0] [pending-conditions '()] [skip-zk #t])
+      (guard (c [else #f])
+        (with-exception-handler
+          (lambda (c) (if (warning? c) (void) (raise-continuable c)))
+          (lambda ()
+            (generate-everything source target)
+            (null? (pending-conditions)))))))
+
+  (let ([fixtures (find-fixtures fixture-root)] [n 0])
+    (printf "found ~d fixtures under ~a\n" (length fixtures) fixture-root)
+    (for-each
+      (lambda (fixture)
+        (let* ([source (car fixture)]
+               [expect-failure? (cdr fixture)]
+               [ok? (compiles? source scratch-dir)])
+          (if (eq? ok? (not expect-failure?))
+              (set! n (+ n 1))
+              (begin
+                (failed #t)
+                (printf "fixture ~a ~a\n"
+                  source
+                  (if expect-failure?
+                      "compiled, but a compile.fail.test.ts says it should not have"
+                      "failed to compile, but no compile.fail.test.ts says it should"))))))
+      fixtures)
+    (rm-rf scratch-dir)
+    (printf "~d of ~d fixtures produced their expected compile result\n"
+      n (length fixtures))))
+(collect (collect-maximum-generation))
+(unless (file-directory? "test-contracts/coverage") (mkdir "test-contracts/coverage"))
+(profile-dump-html "test-contracts/coverage/")
+(let ([ls (filter (lambda (x) (equal? (path-first (cadr x)) "compiler")) (profile-dump-list))])
+  (let ([total (length ls)]
+        [hit (fold-left (lambda (hit x) (if (> (car x) 0) (+ hit 1) hit)) 0 ls)])
+    (printf "======== END OF FIXTURE TESTS. COVERAGE = ~d% (~d/~d). ========\n"
+      (if (= total 0) 0 (round (* 100 (/ hit total))))
+      hit
+      total)))
+(exit (if (let () (import (go)) (failed)) 1 0))
+END
