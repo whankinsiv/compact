@@ -25,6 +25,7 @@ nix develop --no-warn-dirty .#test-contracts --command bash -c '
   ln -sfn "${COMPACT_RUNTIME_PKG:-../runtime}" .compact-runtime
   export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
   corepack yarn install --immutable
+  cargo build --release --manifest-path tools/verify-proof-fixtures/Cargo.toml
   COMPACT_BINARY=compactc corepack yarn lint
   COMPACT_BINARY=compactc corepack yarn test "$@"
 ' bash "$@"

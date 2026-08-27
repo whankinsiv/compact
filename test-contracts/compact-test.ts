@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,6 +22,63 @@ import {
     createConstructorContext,
     dummyContractAddress,
 } from '@midnight-ntwrk/compact-runtime';
+
+const packageRoot = path.dirname(fileURLToPath(import.meta.url));
+const innerProofOutputDir = path.join(
+    packageRoot,
+    'tools',
+    'verify-proof-fixtures',
+    'out',
+);
+
+/**
+ * A midnight-zk proof a `verifyProof` fixture verifies, built from the relation
+ * of the same name in `tools/verify-proof-fixtures/src/proofs/`.
+ */
+export type InnerProof = {
+    circuit: string;
+    vkHash: string;
+    vk: Uint8Array;
+    instance: bigint[];
+    proof: Uint8Array;
+};
+
+type InnerProofBundle = {
+    circuit: string;
+    vkHash: string;
+    vk: string;
+    instance: string[];
+    proof: string;
+};
+
+/**
+ * Reads the generated bundle for one inner circuit.
+ *
+ * The runner rebuilds every bundle before a run, so a missing one means the
+ * generator has not run rather than that the fixture is misconfigured.
+ */
+export function readInnerProof(circuit: string): InnerProof {
+    const bundlePath = path.join(innerProofOutputDir, `${circuit}.json`);
+    let bundle: InnerProofBundle;
+
+    try {
+        bundle = JSON.parse(
+            readFileSync(bundlePath, 'utf8'),
+        ) as InnerProofBundle;
+    } catch (error) {
+        throw new Error(
+            `${bundlePath} is missing or unreadable; run yarn test, which rebuilds inner proofs: ${error}`,
+        );
+    }
+
+    return {
+        circuit: bundle.circuit,
+        vkHash: bundle.vkHash,
+        vk: new Uint8Array(Buffer.from(bundle.vk, 'base64')),
+        instance: bundle.instance.map((value) => BigInt(value)),
+        proof: new Uint8Array(Buffer.from(bundle.proof, 'base64')),
+    };
+}
 
 type TestPhase = 'compile' | 'runtime';
 export type TestResult = 'pass' | 'fail';

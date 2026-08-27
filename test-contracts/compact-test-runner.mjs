@@ -24,6 +24,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const compactTestFilePattern = /^(compile|runtime)\.(pass|fail)\.test\.ts$/;
 const compactTestModuleSpecifier = '@test/compact-test';
+const innerProofGeneratorPath = path.join(
+    testRoot,
+    'tools',
+    'verify-proof-fixtures',
+    'target',
+    'release',
+    'verify-proof-fixtures',
+);
 
 // Fixture metadata lives in TypeScript modules that Vitest resolves through its
 // `@test/compact-test` alias. Node strips the types on its own, so teaching it
@@ -122,6 +130,7 @@ function parseRunnerArgs(args) {
  */
 async function runVitest(filters, vitestArgs) {
     await cleanSelectedFixtureArtifacts(filters);
+    await regenerateInnerProofs();
 
     const vitestEntry = path.join(testRoot, 'node_modules', 'vitest', 'vitest.mjs');
     const code = await spawnProcess(
@@ -365,6 +374,36 @@ function compileContract(contractPath, outputDir, options = {}) {
 }
 
 /**
+ * Rebuilds every inner proof the verifyProof fixtures verify.
+ *
+ * The statements are midnight-zk relations in `tools/verify-proof-fixtures`,
+ * which proves each with the Poseidon transcript the in-circuit verifier
+ * requires and writes a bundle to its `out/` directory: the verifying key, its
+ * sha256, the statement's public inputs and the proof. The generator knows its
+ * own circuits, so this rebuilds all of them regardless of which fixtures a run
+ * selects. The bundles are generated output rather than checked in, so the
+ * generator has to be built before a fixture that needs one can run.
+ */
+async function regenerateInnerProofs() {
+    if (!(await isExecutable(innerProofGeneratorPath))) {
+        throw new Error(
+            `verify-proof-fixtures is not built, so inner proofs cannot be rebuilt.\n` +
+                `  build it with: cargo build --release --manifest-path tools/verify-proof-fixtures/Cargo.toml\n` +
+                `  or run ./test-contracts/test.sh, which builds it first.`,
+        );
+    }
+
+    const code = await spawnProcess(innerProofGeneratorPath, [], {
+        cwd: testRoot,
+        stdio: 'inherit',
+    });
+
+    if (code !== 0) {
+        throw new Error(`inner proof generation failed with exit code ${code}`);
+    }
+}
+
+/**
  * Reads the compiler flags a fixture declares through `defineCompileTest`.
  */
 async function fixtureCompilerFlags(fixture) {
@@ -392,6 +431,19 @@ async function loadCompileDefinition(fixture) {
     }
 
     return definition;
+}
+
+/**
+ * Checks whether a path exists and is executable.
+ */
+async function isExecutable(candidate) {
+    try {
+        await fs.access(candidate, fsConstants.X_OK);
+
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**

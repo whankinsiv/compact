@@ -72,6 +72,37 @@ through the ZKIR v3 backend, and because the pinned zkir binary does not yet
 implement the `inner_proof`/`verify_proof` gates that proving-key generation
 would need.
 
+## Inner Proofs
+
+The statements the `verifyProof` fixtures verify are midnight-zk relations, one
+module each in `tools/verify-proof-fixtures/src/proofs/`. The runner rebuilds
+every proof before the compile phase begins, writing a bundle to that tool's
+`out/` directory holding the verifying key, its sha256, the statement's public
+inputs and the proof. A runtime test reads one with
+`readInnerProof('<circuit>')`.
+
+```json
+{
+    "circuit": "basic",
+    "vkHash": "ede1c712...",
+    "vk": "<base64>",
+    "instance": ["123"],
+    "proof": "<base64>"
+}
+```
+
+A runtime test pins the bundle's `vkHash` against the constant its contract
+compiles in, so a relation edited without the contract following fails there
+rather than verifying a different statement unnoticed.
+
+The bundles are generated output rather than checked in, so the generator has
+to exist before a fixture that needs one can run. `./test-contracts/test.sh`
+builds it; on its own, build it with:
+
+```sh
+cargo build --release --manifest-path tools/verify-proof-fixtures/Cargo.toml
+```
+
 ## Runtime Tests
 
 Runtime tests statically import the generated contract path for their fixture
