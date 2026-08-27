@@ -449,7 +449,11 @@ async function compileFixtureUncached(
             recursive: true,
         });
 
-        const result = await compileContract(fixture.contractPath, fixture.outputDir);
+        const result = await compileContract(
+            fixture.contractPath,
+            fixture.outputDir,
+            fixture.compileDefinition.options.compilerFlags ?? [],
+        );
 
         return {
             contractPath: fixture.contractPath,
@@ -541,6 +545,7 @@ function releaseCompileSlot(exclusive: boolean) {
 function compileContract(
     contractPath: string,
     outputDir: string,
+    compilerFlags: string[],
 ): Promise<{
     stderr: string;
     stdout: string;
@@ -550,7 +555,7 @@ function compileContract(
         const compilerPath = process.env.COMPACT_BINARY ?? 'compactc';
         const child = spawn(
             compilerPath,
-            compilerArgs(compilerPath, contractPath, outputDir),
+            compilerArgs(compilerPath, contractPath, outputDir, compilerFlags),
             {
                 stdio: ['ignore', 'pipe', 'pipe'],
             },
@@ -579,15 +584,21 @@ function compileContract(
 
 /**
  * Builds argv for either the Nix `compactc` binary or a `compact` wrapper.
+ *
+ * Fixture-declared `compilerFlags` precede the contract path so fixtures that
+ * need a non-default compiler mode, such as ZKIR v3, can opt into it.
  */
 function compilerArgs(
     compilerPath: string,
     contractPath: string,
     outputDir: string,
+    compilerFlags: string[],
 ) {
+    const coreArgs = [...compilerFlags, contractPath, outputDir];
+
     return path.basename(compilerPath) === 'compact'
-        ? ['compile', contractPath, outputDir]
-        : [contractPath, outputDir];
+        ? ['compile', ...coreArgs]
+        : coreArgs;
 }
 
 /**

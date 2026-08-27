@@ -109,6 +109,7 @@ type ExpectedCompileError = RegExp | ((result: CompileResult) => boolean);
 
 type CompileTestOptions = {
     expectedError?: ExpectedCompileError;
+    compilerFlags?: string[];
 };
 
 type RuntimeTestOptions = {

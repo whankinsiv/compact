@@ -58,6 +58,20 @@ export default defineCompileTest(import.meta.url, {
 });
 ```
 
+Fixtures that need a non-default compiler mode declare `compilerFlags`, which
+are passed to `compactc` ahead of the contract and output paths:
+
+```ts
+export default defineCompileTest(import.meta.url, {
+    compilerFlags: ['--feature-zkir-v3', '--skip-zk'],
+});
+```
+
+The `stdlib/verify_proof/` fixtures use this because `verifyProof` only lowers
+through the ZKIR v3 backend, and because the pinned zkir binary does not yet
+implement the `inner_proof`/`verify_proof` gates that proving-key generation
+would need.
+
 ## Runtime Tests
 
 Runtime tests statically import the generated contract path for their fixture
@@ -136,6 +150,6 @@ cache (`$COMPACT_RUNTIME_PKG`, falling back to `../runtime`), installs this
 package with Corepack/Yarn, and runs the fixtures with the Nix-built `compactc`
 compiler. Compile hang
 protection is owned by Vitest and CI through `testTimeout` in
-`vitest.config.ts`. `yarn lint` prepares generated imports with `--skip-zk`;
-`yarn test` uses full compiler runs so compile tests still cover proving-key
-generation.
+`vitest.config.ts`. `yarn lint` prepares generated imports with `--skip-zk`,
+alongside any `compilerFlags` the fixture declares; `yarn test` uses full
+compiler runs so compile tests still cover proving-key generation.

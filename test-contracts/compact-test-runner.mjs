@@ -17,11 +17,31 @@
 import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
+import { registerHooks } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const compactTestFilePattern = /^(compile|runtime)\.(pass|fail)\.test\.ts$/;
+const compactTestModuleSpecifier = '@test/compact-test';
+
+// Fixture metadata lives in TypeScript modules that Vitest resolves through its
+// `@test/compact-test` alias. Node strips the types on its own, so teaching it
+// the same alias lets this runner read `defineCompileTest` options, such as
+// fixture-declared compiler flags, without duplicating them elsewhere.
+registerHooks({
+    resolve(specifier, context, nextResolve) {
+        if (specifier === compactTestModuleSpecifier) {
+            return {
+                url: pathToFileURL(path.join(testRoot, 'compact-test.ts')).href,
+                shortCircuit: true,
+            };
+        }
+
+        return nextResolve(specifier, context);
+    },
+});
+
 const prepareArtifactsFlag = '--prepare-artifacts';
 const optionsWithValues = new Set([
     '-t',
@@ -283,6 +303,7 @@ async function compileFixtureForTypecheck(fixture) {
 
     const result = await compileContract(contractPath, outputDir, {
         skipZk: true,
+        compilerFlags: await fixtureCompilerFlags(fixture),
     });
 
     if (result.exitCode !== 0) {
@@ -344,12 +365,49 @@ function compileContract(contractPath, outputDir, options = {}) {
 }
 
 /**
+ * Reads the compiler flags a fixture declares through `defineCompileTest`.
+ */
+async function fixtureCompilerFlags(fixture) {
+    const definition = await loadCompileDefinition(fixture);
+
+    return definition.options?.compilerFlags ?? [];
+}
+
+/**
+ * Imports a fixture's compile metadata, which both the compiler flags and the
+ * inner-proof statement are read from.
+ */
+async function loadCompileDefinition(fixture) {
+    const module = await import(pathToFileURL(fixture.compile.filePath).href);
+    const definition = module.default;
+
+    if (
+        definition === null ||
+        typeof definition !== 'object' ||
+        definition.kind !== 'compact-compile-test'
+    ) {
+        throw new Error(
+            `${fixture.relativeFixtureDir} compile test must export a defineCompileTest result`,
+        );
+    }
+
+    return definition;
+}
+
+/**
  * Builds argv for either the Nix `compactc` binary or a `compact` wrapper.
+ *
+ * Fixture-declared flags come first so a fixture can select a non-default
+ * compiler mode, such as ZKIR v3, for both artifact preparation and testing.
  */
 function compilerArgs(contractPath, outputDir, options = {}) {
-    const coreArgs = options.skipZk
-        ? ['--skip-zk', contractPath, outputDir]
-        : [contractPath, outputDir];
+    const flags = [...(options.compilerFlags ?? [])];
+
+    if (options.skipZk && !flags.includes('--skip-zk')) {
+        flags.push('--skip-zk');
+    }
+
+    const coreArgs = [...flags, contractPath, outputDir];
 
     return path.basename(resolvedCompilerPath) === 'compact'
         ? ['compile', ...coreArgs]
