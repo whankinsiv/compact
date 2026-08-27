@@ -17,6 +17,7 @@ import '@midnight-ntwrk/compact-runtime';
 
 declare module '@midnight-ntwrk/compact-runtime' {
     export interface CircuitContext<PrivateState = any> {
+        callContext: any;
         currentPrivateState: PrivateState;
         currentZswapLocalState: any;
         currentQueryContext: any;
@@ -29,6 +30,12 @@ declare module '@midnight-ntwrk/compact-runtime' {
         context: CircuitContext<PrivateState>;
         proofData: any;
         gasCost: any;
+    }
+
+    export interface WitnessContext<Ledger = any, PrivateState = any> {
+        readonly ledger: Ledger;
+        readonly privateState: PrivateState;
+        readonly contractAddress: any;
     }
 
     export interface ConstructorContext<PrivateState = any> {
