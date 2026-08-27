@@ -1,0 +1,37 @@
+// This file is part of Compact.
+// Copyright (C) 2025 Midnight Foundation
+// SPDX-License-Identifier: Apache-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//  	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import CompactStandardLibrary;
+
+export { verify_proof_basic }
+
+witness inner_proof(): Opaque<"Uint8Array">;
+
+export ledger attested_value: Field;
+
+circuit verify_proof_basic(value: Field): [] {
+    // verifyProof requires the key to reduce to a constant at compile time, so
+    // it can be neither an argument nor a ledger cell. This is the `basic`
+    // circuit's vkHash, pinned again in runtime.pass.test.ts.
+    const basic_vk = Bytes[0xed, 0xe1, 0xc7, 0x12, 0x91, 0xe0, 0xc6, 0x91,
+                           0x9f, 0xa1, 0xe1, 0xb8, 0xae, 0xfe, 0x0d, 0x6f,
+                           0x84, 0x98, 0x85, 0x2a, 0x23, 0x97, 0x1f, 0x93,
+                           0x6f, 0x3e, 0x3c, 0x48, 0x57, 0x21, 0xa1, 0xba]
+                           as VerifyingKeyHash;
+
+    attested_value = disclose(value);
+
+    verifyProof<1>(basic_vk, inner_proof(), [attested_value]);
+}
