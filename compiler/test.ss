@@ -57,7 +57,7 @@ check. For example:
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          (block (return ,(string->utf8 "Hello world!"))))))
+          (block (return "Hello world!")))))
     )
 
 When replacing a check form with the one printed by the test driver, resist
@@ -750,12 +750,18 @@ groups than for single tests.
       (define javascript-dir "compiler/javascript-code")
       (define javascript-counter 0)
       (define javascript-op #f)
+      ;; This used to read through a textual port with `get-string-all`, which
+      ;; decodes UTF-8 and silently substitutes U+FFFD for every invalid byte. That is harmless for
+      ;; the generated `.js`, `.d.ts` and `.zkir`, and fatal for the binary verifier and prover keys:
+      ;; the ASCII `midnight:verifier-key[vN]:` header survives, so the file still looks right, but
+      ;; the SCALE length prefix immediately after it is mangled and the ledger rejects the key with
+      ;; `out of range for u32`.
       (define (copy-file ifn ofn)
-        (call-with-port
-          (open-output-file ofn)
-          (lambda (op)
-            (let ([x (call-with-port (open-input-file ifn) get-string-all)])
-              (unless (eof-object? x) (put-string op x))))))
+        (let ([bv (call-with-port (open-file-input-port ifn) get-bytevector-all)])
+          (call-with-port
+            (open-file-output-port ofn (file-options replace))
+            (lambda (op)
+              (unless (eof-object? bv) (put-bytevector op bv))))))
       (define (copy-dir src dst)
         (when (file-directory? src)
           (mkdir-p dst)
@@ -904,85 +910,406 @@ groups than for single tests.
 
 (parameterize ([feature-zkir-v3 #t])
 (run-tests save-manifest
+  (test-group
+    ((create-file "loop.compact" '("include 'loop';")))
+    ((create-file "testfile.compact"
+       '(
+         "module M {"
+         "  include 'loop';"
+         "}"
+         ))
+     (oops
+       message: "~a:\n  ~?"
+       irritants: '("loop.compact line 1 char 1" "include cycle involving ~s" ("compiler/testdir/loop.compact")))
+     ))
+
+;;; verifyProof takes a string-literal pathname, zero generic parameters, and a
+;;; verifying key read at compile time.  The key lives outside `testdir`, which
+;;; `recreate-testdir` wipes between runs, so `compact-path` reaches it instead.
+;;; `compiler/testdata/testfile.verifier` is a placeholder rather than a real
+;;; key: expansion only slurps the file's bytes, but verifying a proof against
+;;; it would not, so these tests stop short of the staged JavaScript.
+
+ (with-compact-path '("compiler/testdata")
   (test
     '(
       "import CompactStandardLibrary;"
       "ledger X: Field;"
-      "circuit vk(): VerifyingKeyHash {"
-      "  return pad(32, 'hello') as VerifyingKeyHash;"
-      "}"
       "export circuit foo(x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
       "  X = disclose(x);"
-      "  verifyProof<2>(vk(), p, [X, disclose(y)]);"
+      "  verifyProof('testfile.verifier', p, [X, disclose(y)]);"
       "}"
       )
-    (pass-returns infer-types '(what))
-    (output-file "compiler/testdir/contract/index.d.ts" '())
-    (output-file "compiler/testdir/contract/index.js" '())
-    (output-file "compiler/testdir/contract/index.js" '())
-    (output-file "compiler/testdir/zkir/foo.zkir" '())
-    (stage-javascript
+    ;; Expected contents are placeholders: a failing run rewrites them in place
+    ;; with what the compiler actually produced.
+    (output-file "compiler/testdir/contract/index.d.ts"
       '(
-        "test('failing verifyProof call', async () => {"
-        "  const [contract, context] = await startContract(contractCode, {}, 0);"
-        "  expect((await contract.circuits.foo(context, 17n, 23n, new Uint8Array(32))).result).toEqual([]);"
-        "});"
-        ))
-    )
+        "import type * as __compactRuntime from '@midnight-ntwrk/compact-runtime';"
+        ""
+        "export type Witnesses<PS> = {"
+        "}"
+        ""
+        "export type ImpureCircuits<PS> = {"
+        "  foo(context: __compactRuntime.CircuitContext<PS>,"
+        "      x_0: bigint,"
+        "      y_0: bigint,"
+        "      p_0: Uint8Array): Promise<__compactRuntime.CircuitResults<PS, []>>;"
+        "}"
+        ""
+        "export type ProvableCircuits<PS> = {"
+        "  foo(context: __compactRuntime.CircuitContext<PS>,"
+        "      x_0: bigint,"
+        "      y_0: bigint,"
+        "      p_0: Uint8Array): Promise<__compactRuntime.CircuitResults<PS, []>>;"
+        "}"
+        ""
+        "export type PureCircuits = {"
+        "}"
+        ""
+        "export type Circuits<PS> = {"
+        "  foo(context: __compactRuntime.CircuitContext<PS>,"
+        "      x_0: bigint,"
+        "      y_0: bigint,"
+        "      p_0: Uint8Array): Promise<__compactRuntime.CircuitResults<PS, []>>;"
+        "}"
+        ""
+        "export type Ledger = {"
+        "}"
+        ""
+        "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
+        "  witnesses: W;"
+        "  circuits: Circuits<PS>;"
+        "  impureCircuits: ImpureCircuits<PS>;"
+        "  provableCircuits: ProvableCircuits<PS>;"
+        "  constructor(witnesses: W);"
+        "  initialState(context: __compactRuntime.ConstructorContext<PS>): Promise<__compactRuntime.ConstructorResult<PS>>;"
+        "}"
+        ""
+        "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
+        "export declare const pureCircuits: PureCircuits;"
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
+    ; WARNING: Do not replace this wholesale...maintain the structure of the first several
+    ; lines to avoid hard-coding a specific runtime version string into the test
+    (output-file "compiler/testdir/contract/index.js"
+      `(
+        "import * as __compactRuntime from '@midnight-ntwrk/compact-runtime';"
+         ,(format "__compactRuntime.checkRuntimeVersion('~a');" runtime-version-string)
+        ""
+        "const _descriptor_0 = __compactRuntime.CompactTypeField;"
+        ""
+        "const _descriptor_1 = __compactRuntime.CompactTypeOpaqueUint8Array;"
+        ""
+        "const _descriptor_2 = new __compactRuntime.CompactTypeUnsignedInteger(18446744073709551615n, 8);"
+        ""
+        "const _descriptor_3 = __compactRuntime.CompactTypeBoolean;"
+        ""
+        "const _descriptor_4 = new __compactRuntime.CompactTypeBytes(32);"
+        ""
+        "class _Either_0 {"
+        "  alignment() {"
+        "    return _descriptor_3.alignment().concat(_descriptor_4.alignment().concat(_descriptor_4.alignment()));"
+        "  }"
+        "  fromValue(value_0) {"
+        "    return {"
+        "      is_left: _descriptor_3.fromValue(value_0),"
+        "      left: _descriptor_4.fromValue(value_0),"
+        "      right: _descriptor_4.fromValue(value_0)"
+        "    }"
+        "  }"
+        "  toValue(value_0) {"
+        "    return _descriptor_3.toValue(value_0.is_left).concat(_descriptor_4.toValue(value_0.left).concat(_descriptor_4.toValue(value_0.right)));"
+        "  }"
+        "}"
+        ""
+        "const _descriptor_5 = new _Either_0();"
+        ""
+        "const _descriptor_6 = new __compactRuntime.CompactTypeUnsignedInteger(340282366920938463463374607431768211455n, 16);"
+        ""
+        "class _ContractAddress_0 {"
+        "  alignment() {"
+        "    return _descriptor_4.alignment();"
+        "  }"
+        "  fromValue(value_0) {"
+        "    return {"
+        "      bytes: _descriptor_4.fromValue(value_0)"
+        "    }"
+        "  }"
+        "  toValue(value_0) {"
+        "    return _descriptor_4.toValue(value_0.bytes);"
+        "  }"
+        "}"
+        ""
+        "const _descriptor_7 = new _ContractAddress_0();"
+        ""
+        "const _descriptor_8 = new __compactRuntime.CompactTypeUnsignedInteger(255n, 1);"
+        ""
+        "const _descriptor_9 = new __compactRuntime.CompactTypeUnsignedInteger(4294967295n, 4);"
+        ""
+        "export class Contract {"
+        "  witnesses;"
+        "  constructor(...args_0) {"
+        "    if (args_0.length !== 1) {"
+        "      throw new __compactRuntime.CompactError(`Contract constructor: expected 1 argument, received ${args_0.length}`);"
+        "    }"
+        "    const witnesses_0 = args_0[0];"
+        "    if (typeof(witnesses_0) !== 'object') {"
+        "      throw new __compactRuntime.CompactError('first (witnesses) argument to Contract constructor is not an object');"
+        "    }"
+        "    this.witnesses = witnesses_0;"
+        "    this.circuits = {"
+        "      foo: async (...args_1) => {"
+        "        if (args_1.length !== 4) {"
+        "          throw new __compactRuntime.CompactError(`foo: expected 4 arguments (as invoked from Typescript), received ${args_1.length}`);"
+        "        }"
+        "        const contextOrig_0 = args_1[0];"
+        "        const x_0 = args_1[1];"
+        "        const y_0 = args_1[2];"
+        "        const p_0 = args_1[3];"
+        "        if (!(typeof(contextOrig_0) === 'object' && contextOrig_0.callContext.currentQueryContext != undefined)) {"
+        "          __compactRuntime.typeError('foo',"
+        "                                     'argument 1 (as invoked from Typescript)',"
+        "                                     'testfile.compact line 3 char 1',"
+        "                                     'CircuitContext',"
+        "                                     contextOrig_0)"
+        "        }"
+        "        if (!(typeof(x_0) === 'bigint' && x_0 >= 0 && x_0 <= __compactRuntime.MAX_FIELD)) {"
+        "          __compactRuntime.typeError('foo',"
+        "                                     'argument 1 (argument 2 as invoked from Typescript)',"
+        "                                     'testfile.compact line 3 char 1',"
+        "                                     'Field',"
+        "                                     x_0)"
+        "        }"
+        "        if (!(typeof(y_0) === 'bigint' && y_0 >= 0 && y_0 <= __compactRuntime.MAX_FIELD)) {"
+        "          __compactRuntime.typeError('foo',"
+        "                                     'argument 2 (argument 3 as invoked from Typescript)',"
+        "                                     'testfile.compact line 3 char 1',"
+        "                                     'Field',"
+        "                                     y_0)"
+        "        }"
+        "        if (!(p_0 instanceof Uint8Array)) {"
+        "          __compactRuntime.typeError('foo',"
+        "                                     'argument 3 (argument 4 as invoked from Typescript)',"
+        "                                     'testfile.compact line 3 char 1',"
+        "                                     'Opaque<\"Uint8Array\">',"
+        "                                     p_0)"
+        "        }"
+        "        const context = __compactRuntime.copyCircuitContext(contextOrig_0);"
+        "        const partialProofData = {"
+        "          input: {"
+        "            value: _descriptor_0.toValue(x_0).concat(_descriptor_0.toValue(y_0).concat(_descriptor_1.toValue(p_0))),"
+        "            alignment: _descriptor_0.alignment().concat(_descriptor_0.alignment().concat(_descriptor_1.alignment()))"
+        "          },"
+        "          output: undefined,"
+        "          publicTranscript: [],"
+        "          privateTranscriptOutputs: [],"
+        "          innerProofs: []"
+        "        };"
+        "        const result_0 = await this._foo_0(context,"
+        "                                           partialProofData,"
+        "                                           x_0,"
+        "                                           y_0,"
+        "                                           p_0);"
+        "        partialProofData.output = { value: [], alignment: [] };"
+        "        __compactRuntime.finalizeCallProofData(context, partialProofData);"
+        "        return { result: result_0, context: context, gasCost: context.callContext.currentGasCost };"
+        "      }"
+        "    };"
+        "    this.impureCircuits = { foo: this.circuits.foo };"
+        "    this.provableCircuits = { foo: this.circuits.foo };"
+        "  }"
+        "  async initialState(...args_0) {"
+        "    if (args_0.length !== 1) {"
+        "      throw new __compactRuntime.CompactError(`Contract state constructor: expected 1 argument (as invoked from Typescript), received ${args_0.length}`);"
+        "    }"
+        "    const constructorContext_0 = args_0[0];"
+        "    if (typeof(constructorContext_0) !== 'object') {"
+        "      throw new __compactRuntime.CompactError(`Contract state constructor: expected 'constructorContext' in argument 1 (as invoked from Typescript) to be an object`);"
+        "    }"
+        "    if (!('initialZswapLocalState' in constructorContext_0)) {"
+        "      throw new __compactRuntime.CompactError(`Contract state constructor: expected 'initialZswapLocalState' in argument 1 (as invoked from Typescript)`);"
+        "    }"
+        "    if (typeof(constructorContext_0.initialZswapLocalState) !== 'object') {"
+        "      throw new __compactRuntime.CompactError(`Contract state constructor: expected 'initialZswapLocalState' in argument 1 (as invoked from Typescript) to be an object`);"
+        "    }"
+        "    const state_0 = new __compactRuntime.ContractState();"
+        "    let stateValue_0 = __compactRuntime.StateValue.newArray();"
+        "    stateValue_0 = stateValue_0.arrayPush(__compactRuntime.StateValue.newNull());"
+        "    state_0.data = new __compactRuntime.ChargedState(stateValue_0);"
+        "    state_0.setOperation('foo', new __compactRuntime.ContractOperation());"
+        "    const context = __compactRuntime.createCircuitContext({circuitId: 'constructor', contractAddress: __compactRuntime.dummyContractAddress(), coinPublicKeyOrZswapState: constructorContext_0.initialZswapLocalState.coinPublicKey, contractState: state_0.data, privateState: constructorContext_0.initialPrivateState});"
+        "    const partialProofData = {"
+        "      input: { value: [], alignment: [] },"
+        "      output: undefined,"
+        "      publicTranscript: [],"
+        "      privateTranscriptOutputs: [],"
+        "      innerProofs: []"
+        "    };"
+        "    __compactRuntime.queryLedgerState(context,"
+        "                                      partialProofData,"
+        "                                      ["
+        "                                       { push: { storage: false,"
+        "                                                 value: __compactRuntime.StateValue.newCell({ value: _descriptor_8.toValue(0n),"
+        "                                                                                              alignment: _descriptor_8.alignment() }).encode() } },"
+        "                                       { push: { storage: true,"
+        "                                                 value: __compactRuntime.StateValue.newCell({ value: _descriptor_0.toValue(0n),"
+        "                                                                                              alignment: _descriptor_0.alignment() }).encode() } },"
+        "                                       { ins: { cached: false, n: 1 } }]);"
+        "    state_0.data = new __compactRuntime.ChargedState(context.callContext.currentQueryContext.state.state);"
+        "    return {"
+        "      currentContractState: state_0,"
+        "      currentPrivateState: context.callContext.currentPrivateState,"
+        "      currentZswapLocalState: context.callContext.currentZswapLocalState"
+        "    }"
+        "  }"
+        "  async _foo_0(context, partialProofData, x_0, y_0, p_0) {"
+        "    __compactRuntime.queryLedgerState(context,"
+        "                                      partialProofData,"
+        "                                      ["
+        "                                       { push: { storage: false,"
+        "                                                 value: __compactRuntime.StateValue.newCell({ value: _descriptor_8.toValue(0n),"
+        "                                                                                              alignment: _descriptor_8.alignment() }).encode() } },"
+        "                                       { push: { storage: true,"
+        "                                                 value: __compactRuntime.StateValue.newCell({ value: _descriptor_0.toValue(x_0),"
+        "                                                                                              alignment: _descriptor_0.alignment() }).encode() } },"
+        "                                       { ins: { cached: false, n: 1 } }]);"
+        "    __compactRuntime.verifyProof(partialProofData,"
+        "                                 '0x000200000000000000000000000000000000010a01000000030a11000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b5b0ad63f4f9ff10cc0fac620048f8bc6386b85ba5526819a7f02cf1166e1699419c08b30a8e4e80f3d1110d32a32df58cabadbe28418d7bd617bb89dd28cda42cc5c6db12d9cefe81de0fcd24446309d7d9d0b585a6989d7af1bfdb1940f6a78da13b92acd82a2058c0489c8a1f4f5eb4078d742092f973ad0c9b93805d013b88f4d225842c154d13cdb7a64f3fd8d0b4cdc2c049585812630d274730892e160ed0707b9273172339bc80732a8ba9a9cb7c4869d9036725d4fa8c7e93550d5cb9d341d456f47ec242f9615e6f08189a378d130055f2cb9ae302899e90818d3ebb927cb2ca532792efc1d4ed8045fcbcad9976080f3f33c9c41ac7ed41fe24a92d58a95dfd584210e381b5b5f86943ca4a6cfd7c7bbe5c1be1f1ceb8493c9e7480986f7215a9b5e4bc69608acaeb755cc0ed4dd7bd88976da07e9c47756f1c9b90ef494c5cc3031ac6c9b5570fe5c45db631f35154ac723272206afbd98caf4b7efbbad741538d0199d6e37af62041bbb916ff14c14acc99fab19c20bb31160a',"
+        "                                 p_0,"
+        "                                 [_descriptor_0.fromValue(__compactRuntime.queryLedgerState(context,"
+        "                                                                                            partialProofData,"
+        "                                                                                            ["
+        "                                                                                             { dup: { n: 0 } },"
+        "                                                                                             { idx: { cached: false,"
+        "                                                                                                      pushPath: false,"
+        "                                                                                                      path: ["
+        "                                                                                                             { tag: 'value',"
+        "                                                                                                               value: { value: _descriptor_8.toValue(0n),"
+        "                                                                                                                        alignment: _descriptor_8.alignment() } }] } },"
+        "                                                                                             { popeq: { cached: false,"
+        "                                                                                                        result: undefined } }]).value),"
+        "                                  y_0]);"
+        "    return [];"
+        "  }"
+        "}"
+        "export function ledger(stateOrChargedState) {"
+        "  const state = stateOrChargedState instanceof __compactRuntime.StateValue ? stateOrChargedState : stateOrChargedState.state;"
+        "  const chargedState = stateOrChargedState instanceof __compactRuntime.StateValue ? new __compactRuntime.ChargedState(stateOrChargedState) : stateOrChargedState;"
+        "  const context = {"
+        "    callContext: { currentQueryContext: new __compactRuntime.QueryContext(chargedState, __compactRuntime.dummyContractAddress()), currentGasCost: __compactRuntime.emptyRunningCost() },"
+        "    costModel: __compactRuntime.CostModel.initialCostModel()"
+        "  };"
+        "  const partialProofData = {"
+        "    input: { value: [], alignment: [] },"
+        "    output: undefined,"
+        "    publicTranscript: [],"
+        "    privateTranscriptOutputs: [],"
+        "    innerProofs: []"
+        "  };"
+        "  return {"
+        "  };"
+        "}"
+        "const _emptyContext = {"
+        "  callContext: { currentQueryContext: new __compactRuntime.QueryContext(new __compactRuntime.ContractState().data, __compactRuntime.dummyContractAddress()), currentGasCost: __compactRuntime.emptyRunningCost() }"
+        "};"
+        "const _dummyContract = new Contract({ });"
+        "export const pureCircuits = {};"
+        "export const expectedVk = {};"
+        ""
+        "export const circuitSignatures = {"
+        "  'foo': {pure: false, provable: true, argumentTypes: [{tag: 'Field'}, {tag: 'Field'}, {tag: 'Opaque', tsType: 'Uint8Array'}], resultType: {tag: 'Tuple', types: []}},"
+        "};"
+        ""
+        "export const declaredInterfaces = {};"
+        ""
+        "//# sourceMappingURL=index.js.map"))
+    (output-file "compiler/testdir/zkir/foo.zkir"
+      '(
+        "{"
+        "  \"version\": { \"major\": 3, \"minor\": 1 },"
+        "  \"do_communications_commitment\": true,"
+        "  \"inputs\": ["
+        "    { \"name\": \"%x.0\", \"type\": \"Scalar<BLS12-381>\" },"
+        "    { \"name\": \"%y.1\", \"type\": \"Scalar<BLS12-381>\" },"
+        "    { \"name\": \"%p.2\", \"type\": \"Scalar<BLS12-381>\" }"
+        "  ],"
+        "  \"outputs\": ["
+        "  ],"
+        "  \"verify_proof_vks\": ["
+        "    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 0, 0, 3, 10, 17, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 181, 176, 173, 99, 244, 249, 255, 16, 204, 15, 172, 98, 0, 72, 248, 188, 99, 134, 184, 91, 165, 82, 104, 25, 167, 240, 44, 241, 22, 110, 22, 153, 65, 156, 8, 179, 10, 142, 78, 128, 243, 209, 17, 13, 50, 163, 45, 245, 140, 171, 173, 190, 40, 65, 141, 123, 214, 23, 187, 137, 221, 40, 205, 164, 44, 197, 198, 219, 18, 217, 206, 254, 129, 222, 15, 205, 36, 68, 99, 9, 215, 217, 208, 181, 133, 166, 152, 157, 122, 241, 191, 219, 25, 64, 246, 167, 141, 161, 59, 146, 172, 216, 42, 32, 88, 192, 72, 156, 138, 31, 79, 94, 180, 7, 141, 116, 32, 146, 249, 115, 173, 12, 155, 147, 128, 93, 1, 59, 136, 244, 210, 37, 132, 44, 21, 77, 19, 205, 183, 166, 79, 63, 216, 208, 180, 205, 194, 192, 73, 88, 88, 18, 99, 13, 39, 71, 48, 137, 46, 22, 14, 208, 112, 123, 146, 115, 23, 35, 57, 188, 128, 115, 42, 139, 169, 169, 203, 124, 72, 105, 217, 3, 103, 37, 212, 250, 140, 126, 147, 85, 13, 92, 185, 211, 65, 212, 86, 244, 126, 194, 66, 249, 97, 94, 111, 8, 24, 154, 55, 141, 19, 0, 85, 242, 203, 154, 227, 2, 137, 158, 144, 129, 141, 62, 187, 146, 124, 178, 202, 83, 39, 146, 239, 193, 212, 237, 128, 69, 252, 188, 173, 153, 118, 8, 15, 63, 51, 201, 196, 26, 199, 237, 65, 254, 36, 169, 45, 88, 169, 93, 253, 88, 66, 16, 227, 129, 181, 181, 248, 105, 67, 202, 74, 108, 253, 124, 123, 190, 92, 27, 225, 241, 206, 184, 73, 60, 158, 116, 128, 152, 111, 114, 21, 169, 181, 228, 188, 105, 96, 138, 202, 235, 117, 92, 192, 237, 77, 215, 189, 136, 151, 109, 160, 126, 156, 71, 117, 111, 28, 155, 144, 239, 73, 76, 92, 195, 3, 26, 198, 201, 181, 87, 15, 229, 196, 93, 182, 49, 243, 81, 84, 172, 114, 50, 114, 32, 106, 251, 217, 140, 175, 75, 126, 251, 186, 215, 65, 83, 141, 1, 153, 214, 227, 122, 246, 32, 65, 187, 185, 22, 255, 20, 193, 74, 204, 153, 250, 177, 156, 32, 187, 49, 22, 10]"
+        "  ],"
+        "  \"instructions\": ["
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x10\", \"0x01\", \"0x01\", \"0x01\", \"0x00\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x11\", \"0x01\", \"0x01\", \"-0x02\", \"%x.0\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x91\"] },"
+        "    { \"op\": \"public_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"%t.3\", \"guard\": null },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x30\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x50\", \"0x01\", \"0x01\", \"0x00\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x0c\", \"0x01\", \"-0x02\", \"%t.3\"] },"
+        "    { \"op\": \"inner_proof\", \"guard\": \"0x01\", \"output\": \"%tmp.4\" },"
+        "    { \"op\": \"verify_proof\", \"guard\": \"0x01\", \"vk_hash\": \"0x2b80075b04df7fa397899a20e9c03f5020bfd150d4c5c13f3230b12cea05a844\", \"instance\": [\"%t.3\", \"%y.1\"], \"proof\": \"%tmp.4\" }"
+        "  ]"
+        "}"))
+    ))
 
+ (with-compact-path '("compiler/testdata")
   (test
     '(
       "import CompactStandardLibrary;"
       "ledger X: Field;"
-      "circuit vk(): VerifyingKeyHash {"
-      "  return pad(32, 'hello') as VerifyingKeyHash;"
-      "}"
       "export circuit foo(b: Boolean, x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
       "  X = disclose(x);"
-      "  if (disclose(b)) verifyProof<2>(vk(), p, [X, disclose(y)]);"
+      "  if (disclose(b)) verifyProof('testfile.verifier', p, [X, disclose(y)]);"
       "}"
       )
-    (output-file "compiler/testdir/zkir/foo.zkir" '())
-    (stage-javascript
+    (output-file "compiler/testdir/zkir/foo.zkir"
       '(
-        "test('failing verifyProof call', async () => {"
-        "  const [contract, context] = await startContract(contractCode, {}, 0);"
-        "  expect((await contract.circuits.foo(context, true, 17n, 23n, new Uint8Array(32))).result).toEqual([]);"
-        "  expect((await contract.circuits.foo(context, false, 17n, 23n, new Uint8Array(32))).result).toEqual([]);"
-        "});"
-        ))
-    )
+        "{"
+        "  \"version\": { \"major\": 3, \"minor\": 1 },"
+        "  \"do_communications_commitment\": true,"
+        "  \"inputs\": ["
+        "    { \"name\": \"%b.0\", \"type\": \"Scalar<BLS12-381>\" },"
+        "    { \"name\": \"%x.1\", \"type\": \"Scalar<BLS12-381>\" },"
+        "    { \"name\": \"%y.2\", \"type\": \"Scalar<BLS12-381>\" },"
+        "    { \"name\": \"%p.3\", \"type\": \"Scalar<BLS12-381>\" }"
+        "  ],"
+        "  \"outputs\": ["
+        "  ],"
+        "  \"verify_proof_vks\": ["
+        "    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 0, 0, 0, 3, 10, 17, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 181, 176, 173, 99, 244, 249, 255, 16, 204, 15, 172, 98, 0, 72, 248, 188, 99, 134, 184, 91, 165, 82, 104, 25, 167, 240, 44, 241, 22, 110, 22, 153, 65, 156, 8, 179, 10, 142, 78, 128, 243, 209, 17, 13, 50, 163, 45, 245, 140, 171, 173, 190, 40, 65, 141, 123, 214, 23, 187, 137, 221, 40, 205, 164, 44, 197, 198, 219, 18, 217, 206, 254, 129, 222, 15, 205, 36, 68, 99, 9, 215, 217, 208, 181, 133, 166, 152, 157, 122, 241, 191, 219, 25, 64, 246, 167, 141, 161, 59, 146, 172, 216, 42, 32, 88, 192, 72, 156, 138, 31, 79, 94, 180, 7, 141, 116, 32, 146, 249, 115, 173, 12, 155, 147, 128, 93, 1, 59, 136, 244, 210, 37, 132, 44, 21, 77, 19, 205, 183, 166, 79, 63, 216, 208, 180, 205, 194, 192, 73, 88, 88, 18, 99, 13, 39, 71, 48, 137, 46, 22, 14, 208, 112, 123, 146, 115, 23, 35, 57, 188, 128, 115, 42, 139, 169, 169, 203, 124, 72, 105, 217, 3, 103, 37, 212, 250, 140, 126, 147, 85, 13, 92, 185, 211, 65, 212, 86, 244, 126, 194, 66, 249, 97, 94, 111, 8, 24, 154, 55, 141, 19, 0, 85, 242, 203, 154, 227, 2, 137, 158, 144, 129, 141, 62, 187, 146, 124, 178, 202, 83, 39, 146, 239, 193, 212, 237, 128, 69, 252, 188, 173, 153, 118, 8, 15, 63, 51, 201, 196, 26, 199, 237, 65, 254, 36, 169, 45, 88, 169, 93, 253, 88, 66, 16, 227, 129, 181, 181, 248, 105, 67, 202, 74, 108, 253, 124, 123, 190, 92, 27, 225, 241, 206, 184, 73, 60, 158, 116, 128, 152, 111, 114, 21, 169, 181, 228, 188, 105, 96, 138, 202, 235, 117, 92, 192, 237, 77, 215, 189, 136, 151, 109, 160, 126, 156, 71, 117, 111, 28, 155, 144, 239, 73, 76, 92, 195, 3, 26, 198, 201, 181, 87, 15, 229, 196, 93, 182, 49, 243, 81, 84, 172, 114, 50, 114, 32, 106, 251, 217, 140, 175, 75, 126, 251, 186, 215, 65, 83, 141, 1, 153, 214, 227, 122, 246, 32, 65, 187, 185, 22, 255, 20, 193, 74, 204, 153, 250, 177, 156, 32, 187, 49, 22, 10]"
+        "  ],"
+        "  \"instructions\": ["
+        "    { \"op\": \"constrain_to_boolean\", \"val\": \"%b.0\" },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x10\", \"0x01\", \"0x01\", \"0x01\", \"0x00\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x11\", \"0x01\", \"0x01\", \"-0x02\", \"%x.1\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"0x01\", \"inputs\": [\"0x91\"] },"
+        "    { \"op\": \"public_input\", \"type\": \"Scalar<BLS12-381>\", \"output\": \"%t.4\", \"guard\": \"%b.0\" },"
+        "    { \"op\": \"impact\", \"guard\": \"%b.0\", \"inputs\": [\"0x30\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"%b.0\", \"inputs\": [\"0x50\", \"0x01\", \"0x01\", \"0x00\"] },"
+        "    { \"op\": \"impact\", \"guard\": \"%b.0\", \"inputs\": [\"0x0c\", \"0x01\", \"-0x02\", \"%t.4\"] },"
+        "    { \"op\": \"inner_proof\", \"guard\": \"%b.0\", \"output\": \"%tmp.5\" },"
+        "    { \"op\": \"verify_proof\", \"guard\": \"%b.0\", \"vk_hash\": \"0x2b80075b04df7fa397899a20e9c03f5020bfd150d4c5c13f3230b12cea05a844\", \"instance\": [\"%t.4\", \"%y.2\"], \"proof\": \"%tmp.5\" }"
+        "  ]"
+        "}"))
+    ))
 
+ ;; The public inputs reach the on-chain instance, so a witness value flowing
+ ;; into them has to be disclosed.
+ (with-compact-path '("compiler/testdata")
   (test
     '(
       "import CompactStandardLibrary;"
       "ledger X: Field;"
-      "circuit vk(): VerifyingKeyHash {"
-      "  return pad(32, 'hello') as VerifyingKeyHash;"
-      "}"
       "export circuit foo(x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
       "  X = disclose(x);"
-      "  verifyProof<2>(vk(), p, [X, y]);"
+      "  verifyProof('testfile.verifier', p, [X, y]);"
       "}"
       )
     (oops
       message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 8 char 3" "potential witness-value disclosure must be declared but is not:\n    witness value potentially disclosed:\n      ~a~{~a~}" ("the value of parameter y of exported circuit foo at line 6 char 30" ("\n    nature of the disclosure:\n      the call to standard-library circuit verifyProof might disclose the result of verifying a proof involving the witness value\n    via this path through the program:\n      the third argument to verifyProof at line 8 char 3"))))
-    )
-
-  (test
-    '(
-      "import CompactStandardLibrary;"
-      "ledger X: Field;"
-      "export circuit foo(vk: VerifyingKeyHash, x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
-      "  X = disclose(x);"
-      "  verifyProof<2>(vk, p, [X, disclose(y)]);"
-      "}"
-      )
-    (oops
-      message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 5 char 3" "verifyProof verifying-key did not reduce to a constant at compile time" ()))
-    )
+      irritants: '("testfile.compact line 5 char 3" "potential witness-value disclosure must be declared but is not:\n    witness value potentially disclosed:\n      ~a~{~a~}" ("the value of parameter y of exported circuit foo at line 3 char 30" ("\n    nature of the disclosure:\n      proof verification might disclose the result of verifying a proof involving the witness value\n    via this path through the program:\n      the proof verification at line 5 char 3"))))
+    ))
 
   (test
     '(
@@ -990,12 +1317,54 @@ groups than for single tests.
       "ledger X: Field;"
       "export circuit foo(vk: Bytes<32>, x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
       "  X = disclose(x);"
-      "  verifyProof<2>(vk, p, [X, disclose(y)]);"
+      "  verifyProof(vk, p, [X, disclose(y)]);"
       "}"
       )
     (oops
       message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 5 char 3" "no compatible function named ~a is in scope at this call~@[~a~]~@[~a~]~@[~a~]" (verifyProof #f "\n    one function is incompatible with the supplied argument types\n      supplied argument types:\n        (Bytes<32>, Opaque<\"Uint8Array\">, [Field, Field])\n      declared argument types for function at <standard library>:\n        (VerifyingKeyHash, Opaque<\"Uint8Array\">, Vector<2, Field>)" #f)))
+      irritants: '("testfile.compact line 5 char 3" "verifyProof expects its first subform to be a string" ()))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "ledger X: Field;"
+      "export circuit foo(x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
+      "  X = disclose(x);"
+      "  verifyProof<2>('testfile.verifier', p, [X, disclose(y)]);"
+      "}"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 5 char 3" "verifyProof expects zero generic parameters, received ~d" (1)))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "ledger X: Field;"
+      "export circuit foo(x: Field, p: Opaque<'Uint8Array'>): [] {"
+      "  X = disclose(x);"
+      "  verifyProof('testfile.verifier', p);"
+      "}"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 5 char 3" "verifyProof expects three subforms, received ~d" (2)))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "ledger X: Field;"
+      "export circuit foo(x: Field, y: Field, p: Opaque<'Uint8Array'>): [] {"
+      "  X = disclose(x);"
+      "  verifyProof('no-such-key.verifier', p, [X, disclose(y)]);"
+      "}"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 5 char 3" "failed to locate file ~s" ("no-such-key.verifier")))
     )
 )
 (run-javascript)
@@ -1027,7 +1396,7 @@ groups than for single tests.
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          (block (return ,(string->utf8 "Hello world!"))))))
+          (block (return "Hello world!")))))
     )
 
   (test
@@ -1790,10 +2159,7 @@ groups than for single tests.
           (block (for i (tuple 3 2 1) (+ i 1))))
         (circuit #f #f ballot_repr () ()
              (tbytes 32)
-          (block
-            (return
-              #vu8(121 101 115 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-                   0 0 0 0 0 0 0))))
+          (block (return (pad 32 "yes"))))
         (circuit #f #f check_rel_ops () ([x (tunsigned 16)])
              (tboolean)
           (block
@@ -4336,10 +4702,7 @@ groups than for single tests.
             (block
               (return
                 (call (fref persistent_hash (tvector 2 (tbytes 32)))
-                  (tuple
-                    #vu8(119 101 108 99 111 109 101 58 112 107 58 0 0 0 0 0 0 0
-                         0 0 0 0 0 0 0 0 0 0 0 0 0 0)
-                    sk))))))))
+                  (tuple (pad 32 "welcome:pk:") sk))))))))
     )
 
   (test
@@ -4614,7 +4977,7 @@ groups than for single tests.
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          (block (return ,(string->utf8 "Hello world!"))))))
+          (block (return "Hello world!")))))
     )
 
   (test ;; FIXME uncomment composable contract in test.compact
@@ -4761,10 +5124,7 @@ groups than for single tests.
           (block (for i (tuple 3 2 1) (+ i 1))))
         (circuit #f #f ballot_repr () ()
              (tbytes 32)
-          (block
-            (return
-              #vu8(121 101 115 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-                   0 0 0 0 0 0 0))))
+          (block (return (pad 32 "yes"))))
         (circuit #f #f check_rel_ops () ([x (tunsigned 16)])
              (tboolean)
           (block
@@ -5433,7 +5793,7 @@ groups than for single tests.
         (circuit #f #f foo () ()
              (tbytes 20)
           (block
-            (return ,(string->utf8 "bob's \"fish\"\r\x0;\b\f\t\v"))))))
+            (return "bob's \"fish\"\r\x0;\b\f\t\v")))))
     )
 
   (test
@@ -5442,7 +5802,8 @@ groups than for single tests.
       )
     (oops
       message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 1 char 57" "unexpected ~a" ("character 'q'"))))
+      irritants: '("testfile.compact line 1 char 57" "unexpected ~a" ("character 'q'")))
+    )
 
   (test
     '(
@@ -5938,84 +6299,6 @@ groups than for single tests.
 
   (test
     '(
-      "circuit foo(): Bytes<10> {"
-      "  return \"abc\x1234;def\";"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #f #f foo () ()
-             (tbytes 10)
-          (block (return #vu8(97 98 99 225 136 180 100 101 102))))))
-    )
-
-  (test
-    '(
-      "circuit foo(): Bytes<10> {"
-      "  return \"abc\xDC;def\";"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #f #f foo () ()
-             (tbytes 10)
-          (block (return #vu8(97 98 99 195 156 100 101 102))))))
-    )
-
-  (test
-    '(
-      "circuit foo(): Bytes<10> {"
-      "  return \"abc\\u1234def\";"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #f #f foo () ()
-             (tbytes 10)
-          (block (return #vu8(97 98 99 225 136 180 100 101 102))))))
-    )
-
-  (test
-    '(
-      "circuit foo(): Bytes<10> {"
-      "  return \"abc\\xDCdef\";"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #f #f foo () ()
-             (tbytes 10)
-          (block (return #vu8(97 98 99 195 156 100 101 102))))))
-    )
-
-  (test
-    '(
-      "export circuit foo(b: Boolean): [] {"
-      "  assert(b, 'abc\\u1234def');"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #t #f foo () ([b (tboolean)])
-             (ttuple)
-          (block (assert b "abcሴdef")))))
-    )
-
-  (test
-    '(
-      "export circuit foo(b: Boolean): [] {"
-      "  assert(b, 'abc\\xDCdef');"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #t #f foo () ([b (tboolean)])
-             (ttuple)
-          (block (assert b "abcÜdef")))))
-    )
-
-  (test
-    '(
       "export circuit foo(x : Field) : Field { return x + 3 - x + 4; }"
       )
     (returns
@@ -6036,31 +6319,6 @@ groups than for single tests.
         (circuit #t #f foo () ([x (tboolean)] [y (tboolean)])
              (tfield (field-native))
           (block (return (if x (+ 3 4) (if y (+ 5 6) 7)))))))
-    )
-
-  (test
-    '(
-      "export circuit foo(): Bytes<10> {"
-      "  return pad(10, 'abcdefghij');"
-      "}"
-      )
-    (returns
-      (program
-        (circuit #t #f foo () ()
-             (tbytes 10)
-          (block
-            (return #vu8(97 98 99 100 101 102 103 104 105 106))))))
-    )
-
-  (test
-    '(
-      "export circuit foo(): Bytes<10> {"
-      "  return pad(10, 'abcdefghijkl');"
-      "}"
-      )
-    (oops
-      message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 2 char 10" "cannot pad ~s to length ~s since its utf8-equivalent already exceeds that length" ("abcdefghijkl" 10)))
     )
 
   (test
@@ -6312,7 +6570,7 @@ groups than for single tests.
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          (block (return ,(string->utf8 "Hello world!"))))))
+          (block (return "Hello world!")))))
     )
 
   (test
@@ -6955,10 +7213,7 @@ groups than for single tests.
             (const ([((((a b) a) (b1 b)) b2)
                      (tundeclared)
                      (call bar x1 x2 y z)]))
-            (return
-              (tuple
-                (if b1 a (* 2 a))
-                (if b2 b #vu8(104 101 108 108 111 33))))))))
+            (return (tuple (if b1 a (* 2 a)) (if b2 b "hello!")))))))
     )
 
   (test
@@ -8573,10 +8828,7 @@ groups than for single tests.
               (tundeclared)
               (tuple-ref __compact_pattern_tmp1 1))
             (block
-              (return
-                (tuple
-                  (if b1 a (* 2 a))
-                  (if b2 b #vu8(104 101 108 108 111 33)))))))
+              (return (tuple (if b1 a (* 2 a)) (if b2 b "hello!"))))))
         (circuit #t #f foo () ([x1 (tboolean)]
                                [x2 (tboolean)]
                                [y (tfield (field-native))]
@@ -8655,9 +8907,7 @@ groups than for single tests.
                           (tuple-ref __compact_pattern_tmp1 1))
                         (block
                           (return
-                            (tuple
-                              (if b1 a (* 2 a))
-                              (if b2 b #vu8(104 101 108 108 111 33)))))))
+                            (tuple (if b1 a (* 2 a)) (if b2 b "hello!"))))))
                 t))))))
     )
 
@@ -8807,7 +9057,7 @@ groups than for single tests.
           (tbytes 20)
           (block
             (const x (tundeclared) 5)
-            (return ,(string->utf8 "Hello world!"))))))
+            (return "Hello world!")))))
     )
 
   (test
@@ -8914,7 +9164,7 @@ groups than for single tests.
         (circuit #f #f foo () ([b (tboolean)])
              (tbytes 20)
           (block
-            (if b (return ,(string->utf8 "Hello world!")) (tuple))
+            (if b (return "Hello world!") (tuple))
             (const x (tundeclared) 5)))))
     )
 
@@ -8946,9 +9196,9 @@ groups than for single tests.
              (tbytes 20)
           (block
             (if b
-                (return ,(string->utf8 "Hello world!"))
+                (return "Hello world!")
                 (if (not b)
-                    (return ,(string->utf8 "Hola Mundo!"))
+                    (return "Hola Mundo!")
                     (assert b "oops")))
             (const x (tundeclared) 5)))))
     )
@@ -9049,7 +9299,7 @@ groups than for single tests.
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          (block () (return ,(string->utf8 "Hello world!")))))))
+          (block () (return "Hello world!"))))))
 
   (test
     '(
@@ -9223,10 +9473,7 @@ groups than for single tests.
           (block () (for i (tuple 3 2 1) (+ i 1))))
         (circuit #f #f ballot_repr () ()
              (tbytes 32)
-          (block ()
-            (return
-              #vu8(121 101 115 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-                   0 0 0 0 0 0 0))))
+          (block () (return (pad 32 "yes"))))
         (circuit #f #f check_rel_ops () ([x (tunsigned 16)])
              (tboolean)
           (block ()
@@ -9591,7 +9838,7 @@ groups than for single tests.
       (program
         (circuit #f #f foo () ()
             (tbytes 20)
-          ,(string->utf8 "Hello world!"))))
+          "Hello world!")))
   )
 
   (test
@@ -9664,7 +9911,7 @@ groups than for single tests.
                     (assert (== x 0) "oops 1")))
                 (assert b "oops 2"))
             (assert #t "oops 3")
-            #vu8(72 101 108 108 111 32 119 111 114 108 100 33)))))
+            "Hello world!"))))
     )
 
   (test
@@ -9817,10 +10064,7 @@ groups than for single tests.
         (circuit #f #f foosbar () ()
              (ttuple)
           (seq (for i (tuple 3 2 1) (seq (+ i 1) (tuple))) (tuple)))
-        (circuit #f #f ballot_repr () ()
-             (tbytes 32)
-          #vu8(121 101 115 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-               0 0 0 0 0 0 0))
+        (circuit #f #f ballot_repr () () (tbytes 32) (pad 32 "yes"))
         (circuit #f #f check_rel_ops () ([x (tunsigned 16)])
              (tboolean)
           (or (or (or (or (< x 100) (<= x 10)) (> x 40)) (>= x 45))
@@ -10109,10 +10353,7 @@ groups than for single tests.
         (circuit #f #f foosbar () ()
              (ttuple)
           (seq (for i (tuple 3 2 1) (seq (+ i 1) (tuple))) (tuple)))
-        (circuit #f #f ballot_repr () ()
-             (tbytes 32)
-          #vu8(121 101 115 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
-               0 0 0 0 0 0 0))
+        (circuit #f #f ballot_repr () () (tbytes 32) (pad 32 "yes"))
         (circuit #f #f check_rel_ops () ([x (tunsigned 16)])
              (tboolean)
           (if (if (if (if (< x 100) #t (<= x 10)) #t (> x 40))
@@ -15039,6 +15280,140 @@ groups than for single tests.
         (circuit %foo.0 ([%x.2 (tpoint (curve-jubjub))])
              (tpoint (curve-jubjub))
           %x.2)))
+    )
+
+  (test
+    '(
+      "export circuit foo() : Bytes<20> { return 'bob\\'s \"fish\"\\r\\0\\b\\f\\t\\v'; }"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 20)
+          #vu8(98 111 98 39 115 32 34 102 105 115 104 34 13 0 8 12 9
+               11))))
+    )
+
+  (test
+    '(
+      "circuit foo() : Bytes<20> { return 'bob\\'s \"fish\"\\r\\0\\b\\q\\t\\v'; }"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 1 char 57" "unexpected ~a" ("character 'q'")))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return pad(10, 'abcdefghijkl');"
+      "}"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 2 char 10" "cannot pad ~s to length ~s since its utf8-equivalent already exceeds that length" ("abcdefghijkl" 10)))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return \"abc\x1234;def\";"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 10)
+          #vu8(97 98 99 225 136 180 100 101 102))))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return \"abc\xDC;def\";"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 10)
+          #vu8(97 98 99 195 156 100 101 102))))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return \"abc\\u1234def\";"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 10)
+          #vu8(97 98 99 225 136 180 100 101 102))))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return \"abc\\xDCdef\";"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 10)
+          #vu8(97 98 99 195 156 100 101 102))))
+    )
+
+  (test
+    '(
+      "export circuit foo(b: Boolean): [] {"
+      "  assert(b, 'abc\\u1234def');"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ([%b.1 (tboolean)])
+             (ttuple)
+          (seq (assert %b.1 "abcሴdef") (tuple)))))
+    )
+
+  (test
+    '(
+      "export circuit foo(b: Boolean): [] {"
+      "  assert(b, 'abc\\xDCdef');"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ([%b.1 (tboolean)])
+             (ttuple)
+          (seq (assert %b.1 "abcÜdef") (tuple)))))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return pad(10, 'abcdefghij');"
+      "}"
+      )
+    (returns
+      (program ((foo %foo.0))
+        (circuit %foo.0 ()
+             (tbytes 10)
+          #vu8(97 98 99 100 101 102 103 104 105 106))))
+    )
+
+  (test
+    '(
+      "export circuit foo(): Bytes<10> {"
+      "  return pad(10, 'abcdefghijkl');"
+      "}"
+      )
+    (oops
+      message: "~a:\n  ~?"
+      irritants: '("testfile.compact line 2 char 10" "cannot pad ~s to length ~s since its utf8-equivalent already exceeds that length" ("abcdefghijkl" 10)))
     )
 )
 
@@ -26203,7 +26578,7 @@ groups than for single tests.
       )
     (oops
       message: "~a:\n  ~?"
-      irritants: '("testfile.compact line 2 char 14" "parse error: found ~a looking for~?" ("\"-\"" "~#[ nothing~; ~a~; ~a or ~a~:;~@{~#[~; or~] ~a~^,~}~]" ("a non-negative numeric constant"))))
+      irritants: '("testfile.compact line 2 char 14" "parse error: found ~a looking for~?" ("\"-\"" "~#[ nothing~; ~a~; ~a or ~a~:;~@{~#[~; or~] ~a~^,~}~]" ("a type size"))))
     )
 
   (test
@@ -26690,7 +27065,7 @@ groups than for single tests.
     '(
       "import CompactStandardLibrary;"
       "constructor(){"
-      "  const bob = default<CoinInfo>;"
+      "  const bob = default<ShieldedCoinInfo>;"
       "  const tom = pad(0b1000110101110110011101100011111, 'mABfLuWsISiQzXzpZMgaPXwnrnsy');"
       "  assert (tom == bob < bob, 'WFleWyhsudhbmة');"
       "}"
@@ -72697,10 +73072,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -72712,7 +73083,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -72791,10 +73164,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -72806,7 +73175,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -72894,10 +73265,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -72909,7 +73276,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -73017,10 +73386,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -73032,7 +73397,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -75392,6 +75759,12 @@ groups than for single tests.
      (stage-javascript outerCode "test-center/ts/composable/basic.ts")))
 
   (test-group
+    ((source-file "test-center/composable/Basic/Inner.compact")
+     (stage-javascript innerCode '()))
+    ((source-file "test-center/composable/Basic/Outer.compact")
+     (stage-javascript outerCode "test-center/ts/composable/key-agreement.ts")))
+
+  (test-group
     ((source-file "test-center/composable/Storage/Inner.compact")
      (stage-javascript innerCode '()))
     ((source-file "test-center/composable/Storage/Outer.compact")
@@ -75420,12 +75793,6 @@ groups than for single tests.
      (stage-javascript innerCode '()))
     ((source-file "test-center/composable/Events/Outer.compact")
      (stage-javascript outerCode "test-center/ts/composable/events.ts")))
-
-  (test-group
-    ((source-file "test-center/composable/Recursion/Mutual/A.compact")
-     (stage-javascript aCode '()))
-    ((source-file "test-center/composable/Recursion/Mutual/B.compact")
-     (stage-javascript bCode "test-center/ts/composable/mutual-recursion.ts")))
 
   (test
     "examples/tiny.compact"
@@ -75466,10 +75833,6 @@ groups than for single tests.
         "  readonly value: bigint;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -75481,7 +75844,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     ; WARNING: Do not replace this wholesale...maintain the structure of the first several
     ; lines to avoid hard-coding a specific runtime version string into the test
     (output-file "compiler/testdir/contract/index.js"
@@ -75601,7 +75966,8 @@ groups than for single tests.
         "          },"
         "          output: undefined,"
         "          publicTranscript: [],"
-        "          privateTranscriptOutputs: []"
+        "          privateTranscriptOutputs: [],"
+        "          innerProofs: []"
         "        };"
         "        const result_0 = await this._set_0(context, partialProofData, v_0);"
         "        partialProofData.output = { value: [], alignment: [] };"
@@ -75625,7 +75991,8 @@ groups than for single tests.
         "          input: { value: [], alignment: [] },"
         "          output: undefined,"
         "          publicTranscript: [],"
-        "          privateTranscriptOutputs: []"
+        "          privateTranscriptOutputs: [],"
+        "          innerProofs: []"
         "        };"
         "        const result_0 = await this._get_0(context, partialProofData);"
         "        partialProofData.output = { value: _descriptor_4.toValue(result_0), alignment: _descriptor_4.alignment() };"
@@ -75649,7 +76016,8 @@ groups than for single tests.
         "          input: { value: [], alignment: [] },"
         "          output: undefined,"
         "          publicTranscript: [],"
-        "          privateTranscriptOutputs: []"
+        "          privateTranscriptOutputs: [],"
+        "          innerProofs: []"
         "        };"
         "        const result_0 = await this._clear_0(context, partialProofData);"
         "        partialProofData.output = { value: [], alignment: [] };"
@@ -75705,12 +76073,13 @@ groups than for single tests.
         "    state_0.setOperation('set', new __compactRuntime.ContractOperation());"
         "    state_0.setOperation('get', new __compactRuntime.ContractOperation());"
         "    state_0.setOperation('clear', new __compactRuntime.ContractOperation());"
-        "    const context = __compactRuntime.createCircuitContext('constructor', __compactRuntime.dummyContractAddress(), constructorContext_0.initialZswapLocalState.coinPublicKey, state_0.data, constructorContext_0.initialPrivateState);"
+        "    const context = __compactRuntime.createCircuitContext({circuitId: 'constructor', contractAddress: __compactRuntime.dummyContractAddress(), coinPublicKeyOrZswapState: constructorContext_0.initialZswapLocalState.coinPublicKey, contractState: state_0.data, privateState: constructorContext_0.initialPrivateState});"
         "    const partialProofData = {"
         "      input: { value: [], alignment: [] },"
         "      output: undefined,"
         "      publicTranscript: [],"
-        "      privateTranscriptOutputs: []"
+        "      privateTranscriptOutputs: [],"
+        "      innerProofs: []"
         "    };"
         "    __compactRuntime.queryLedgerState(context,"
         "                                      partialProofData,"
@@ -75947,7 +76316,8 @@ groups than for single tests.
         "    input: { value: [], alignment: [] },"
         "    output: undefined,"
         "    publicTranscript: [],"
-        "    privateTranscriptOutputs: []"
+        "    privateTranscriptOutputs: [],"
+        "    innerProofs: []"
         "  };"
         "  return {"
         "    get value() {"
@@ -75988,9 +76358,16 @@ groups than for single tests.
         "    return _dummyContract._public_key_0(sk_0);"
         "  }"
         "};"
-        "export const contractReferenceLocations ="
-        "  { tag: 'publicLedgerArray', indices: { } };"
         "export const expectedVk = {};"
+        ""
+        "export const circuitSignatures = {"
+        "  'set': {pure: false, provable: true, argumentTypes: [{tag: 'Field'}], resultType: {tag: 'Tuple', types: []}},"
+        "  'get': {pure: false, provable: true, argumentTypes: [], resultType: {tag: 'Struct', name: 'Maybe', elements: [{name: 'is_some', type: {tag: 'Boolean'}}, {name: 'value', type: {tag: 'Field'}}]}},"
+        "  'clear': {pure: false, provable: true, argumentTypes: [], resultType: {tag: 'Tuple', types: []}},"
+        "  'public_key': {pure: true, provable: false, argumentTypes: [{tag: 'Bytes', length: 32}], resultType: {tag: 'Bytes', length: 32}},"
+        "};"
+        ""
+        "export const declaredInterfaces = {};"
         ""
         "//# sourceMappingURL=index.js.map"))
     (output-file "compiler/testdir/contract/index.js.map"
@@ -76001,8 +76378,8 @@ groups than for single tests.
         "  \"sourceRoot\": \"../src/\","
         "  \"sources\": [\"examples/tiny.compact\", \"compiler/standard-library.compact\", \"compiler/zkir-v3-library.compact\"],"
         "  \"names\": [],"
-        "  \"mappings\": \";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;EAsDA;;;;;;;;;;;;;MA2BA,AAAA,GAOC;;;;;cAPW,GAAQ;;;;;;;;;;;;;;;;;;yCAAR,GAAQ;;;;;;;sEAAR,GAAQ;;;;OAOnB;MAWD,AAAA,GAEC;;;;;;;;;;;;;;;;;;;;;;;OAAA;MASD,AAAA,KAQC;;;;;;;;;;;;;;;;;;;;;;;OAAA;MAMD,MAAA,UAEC;;OAAA;;;;;;;;;;;;GAnEA;EALD;;;;;UAAY,GAAQ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;IAHpB;;;;;;;;;yEAA4B;IAC5B;;;;;;;;;yEAA2B;IAC3B;;;;;;;;;yEAAoB;UAEZ,IAAyB;UAC/B,KAAS,sBAAc,IAAE;IAAzB;;;;;;;2HAAA,KAAS;;yEAAA;IACT;;;;;;;2HAAiB,GAAC;;yEAAb;IACL;;;;;;;;;yEAAK;;;;;;;GACN;ECpCD,AAAA,OAEC,CAFsB,OAAQ,mCACU,OAAK,KAC7C;EAED,AAAA,OAEC,4CAAA;EC7BD,AAAA,iBAAA,CAAA,OAAA;oEAAA,OAAA;;GAAA;EFqEA,AAAA,qBAAwC;;0DAAxC,kBAAwC;;;;;;;;;;;;;;GAAA;EAQxC,AAAA,iBAEC,4BAFgB,GAAQ;mCAChB;;;;;;;;;;;wGAAK;;WAAI,GAAC;GAClB;EAED,AAAA,YAOC,4BAPW,GAAQ;;;UAEZ,IAAyB;UACzB,KAAoB,sBAAH,IAAE;IACzB;;;;;;;2HAAY,KAAG;;yEAAN;IACT;;;;;;;2HAAiB,GAAC;;yEAAb;IACL;;;;;;;;;yEAAK;;GACN;EAWD,AAAA,YAEC;;kDAD0C;;;;;;;;;;;uHAAK;;;;GAC/C;EASD,AAAA,cAQC;;;UANO,IAAyB;UACzB,KAAoB,sBAAH,IAAE;0CAClB,KAAG;kEAAI;;;;;;;;;;;uIAAS;;UACvB,KAAS;IAAT;;;;;;;2HAAA,KAAS;;yEAAA;IACT;;;;;;;;;yEAAK;IACL;;;;;;;;;yEAAK;;GACN;EAMD,AAAA,aAEC,CAFkB,IAAa;;mCACmD,IAAE;GACpF;;;;;;;;;;;;;;;;;;;;IA1ED;qCAAA;;;;;;;;;;;0GAA2B;KAAA;;;;;;;;;;EAwE3B,AAAA,UAEC;;;;UAFkB,IAAa;;;;;;;;wCAAb,IAAa;GAE/B;;;;;;\""        "}"
-        ))
+        "  \"mappings\": \";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;EAsDA;;;;;;;;;;;;;MA2BA,AAAA,GAOC;;;;;cAPW,GAAQ;;;;;;;;;;;;;;;;;;yCAAR,GAAQ;;;;;;;;sEAAR,GAAQ;;;;OAOnB;MAWD,AAAA,GAEC;;;;;;;;;;;;;;;;;;;;;;;;OAAA;MASD,AAAA,KAQC;;;;;;;;;;;;;;;;;;;;;;;;OAAA;MAMD,MAAA,UAEC;;OAAA;;;;;;;;;;;;GAnEA;EALD;;;;;UAAY,GAAQ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;IAHpB;;;;;;;;;yEAA4B;IAC5B;;;;;;;;;yEAA2B;IAC3B;;;;;;;;;yEAAoB;UAEZ,IAAyB;UAC/B,KAAS,sBAAc,IAAE;IAAzB;;;;;;;2HAAA,KAAS;;yEAAA;IACT;;;;;;;2HAAiB,GAAC;;yEAAb;IACL;;;;;;;;;yEAAK;;;;;;;GACN;ECpCD,AAAA,OAEC,CAFsB,OAAQ,mCACU,OAAK,KAC7C;EAED,AAAA,OAEC,4CAAA;EC7BD,AAAA,iBAAA,CAAA,OAAA;oEAAA,OAAA;;GAAA;EFqEA,AAAA,qBAAwC;;0DAAxC,kBAAwC;;;;;;;;;;;;;;GAAA;EAQxC,AAAA,iBAEC,4BAFgB,GAAQ;mCAChB;;;;;;;;;;;wGAAK;;WAAI,GAAC;GAClB;EAED,AAAA,YAOC,4BAPW,GAAQ;;;UAEZ,IAAyB;UACzB,KAAoB,sBAAH,IAAE;IACzB;;;;;;;2HAAY,KAAG;;yEAAN;IACT;;;;;;;2HAAiB,GAAC;;yEAAb;IACL;;;;;;;;;yEAAK;;GACN;EAWD,AAAA,YAEC;;kDAD0C;;;;;;;;;;;uHAAK;;;;GAC/C;EASD,AAAA,cAQC;;;UANO,IAAyB;UACzB,KAAoB,sBAAH,IAAE;0CAClB,KAAG;kEAAI;;;;;;;;;;;uIAAS;;UACvB,KAAS;IAAT;;;;;;;2HAAA,KAAS;;yEAAA;IACT;;;;;;;;;yEAAK;IACL;;;;;;;;;yEAAK;;GACN;EAMD,AAAA,aAEC,CAFkB,IAAa;;mCACmD,IAAE;GACpF;;;;;;;;;;;;;;;;;;;;;IA1ED;qCAAA;;;;;;;;;;;0GAA2B;KAAA;;;;;;;;;;EAwE3B,AAAA,UAEC;;;;UAFkB,IAAa;;;;;;;;wCAAb,IAAa;GAE/B;;;;;;;;;;;;;\""
+        "}"))
     (stage-javascript "test-center/ts/tiny.ts")
   )
 
@@ -76443,10 +76820,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -76458,7 +76831,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -76510,10 +76885,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -76525,7 +76896,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -76570,10 +76943,6 @@ groups than for single tests.
         "  readonly greeting: string;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -76585,7 +76954,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -76661,10 +77032,6 @@ groups than for single tests.
         "  readonly rat: bigint;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -76677,7 +77044,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "const witnesses = { witnesses(private_state: any, witnesses: bigint): [any, bigint] { return [private_state, witnesses + 11n]; } };"
@@ -77416,10 +77785,6 @@ groups than for single tests.
         "  };"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -77431,7 +77796,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     )
 
   (test
@@ -77724,10 +78091,6 @@ groups than for single tests.
         "  };"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -77739,7 +78102,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     )
 
   (test
@@ -78409,10 +78774,6 @@ groups than for single tests.
         "  };"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -78424,7 +78785,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     )
 
   (test
@@ -78996,265 +79359,6 @@ groups than for single tests.
         ))
     )
 
-  (test-group
-    ((create-file "C.compact" '())
-     ; stage C alongside testfile: testfile's generated index.js imports
-     ; '../../C/contract/index.js', so C's compiled artifacts must be copied
-     ; to the test directory.  the empty body just stages without emitting tests.
-     (stage-javascript C '()))
-    ((create-file "testfile.compact"
-       '(
-         "import CompactStandardLibrary;"
-         "contract C {};"
-         "ledger X: Field;"
-         ))
-     (stage-javascript
-       '(
-         "test('check 1', async () => {"
-         "  const [C, Ctxt] = await startContract(contractCode, {}, 0);"
-         "  const lcl = contractCode.contractReferenceLocations;"
-         "  expect(lcl['tag']).toEqual('publicLedgerArray');"
-         "  expect(lcl['indices']).toEqual({});"
-         "});"
-         )))
-    )
-
-  (test-group
-    ((create-file "C.compact" '())
-     ; stage C alongside testfile: testfile's generated index.js imports
-     ; '../../C/contract/index.js', so C's compiled artifacts must be copied
-     ; to the test directory.  the empty body just stages without emitting tests.
-     (stage-javascript C '()))
-    ((create-file "testfile.compact"
-       '(
-         "import CompactStandardLibrary;"
-         "contract C {};"
-         "struct Struct1 {"
-         "  a: Field;"
-         "  b: C;"
-         "}"
-         "struct Struct2 {"
-         "  c: Field;"
-         "  d: Struct1;"
-         "}"
-         "ledger m1: Map<Field, C>;"
-         "ledger m2: Map<C, Field>;"
-         "ledger m3: Map<C, Map<C, Field>>;"
-         "ledger s: Struct1;"
-         "ledger r: Struct2;"
-         "ledger t: C;"
-         "ledger u: Field;"
-         "ledger q: Vector<3, C>;"
-         "ledger p: [C, Field];"
-         ))
-     (stage-javascript
-       '(
-         "test('check 1', async () => {"
-         "  const [C, Ctxt] = await startContract(contractCode, {}, 0);"
-         "  const lcl = contractCode.contractReferenceLocations;"
-         "  expect(lcl['tag']).toEqual('publicLedgerArray');"
-         "  expect(lcl['indices']['0']['tag']).toEqual('map');"
-         "  expect(lcl['indices']['1']['keyType']['tag']).toEqual('compactValue');"
-         "  expect(lcl['indices']['1']['keyType']['descriptor']).toBeDefined();"
-         "  expect(lcl['indices']['1']['keyType']['sparseType']).toEqual({tag: 'contractAddress'});"
-         "  expect(lcl['indices']['2']['valueType']['keyType']['sparseType']).toEqual({tag: 'contractAddress'});"
-         "  expect(lcl['indices']['4']['tag']).toEqual('cell');"
-         "  expect(lcl['indices']['4']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'struct',"
-         "                                elements: "
-         "                                  {"
-         "                                   d: {"
-         "                                       tag: 'struct',"
-         "                                       elements: "
-         "                                         { b: { tag: 'contractAddress' } }"
-         "                                      }"
-         "                                  }"
-         "                               });"
-         "  expect(lcl['indices']['6']).toEqual(undefined);"
-         "  expect(lcl['indices']['8']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'tuple',"
-         "                                indices: { 0: { tag: 'contractAddress' } }"
-         "                               });"
-         "});"
-         )))
-    )
-
-  (test-group
-    ((create-file "C.compact" '())
-     ; stage C alongside testfile: testfile's generated index.js imports
-     ; '../../C/contract/index.js', so C's compiled artifacts must be copied
-     ; to the test directory.  the empty body just stages without emitting tests.
-     (stage-javascript C '()))
-    ((create-file "testfile.compact"
-       '(
-         "import CompactStandardLibrary;"
-         "contract C {};"
-         "struct Struct1 {"
-         "  a: Field;"
-         "  b: C;"
-         "}"
-         "struct Struct2 {"
-         "  c: Field;"
-         "  d: Struct1;"
-         "}"
-         "ledger ls1: List<Field>;"
-         "ledger ls2: List<C>;"
-         "ledger ls3: List<Struct1>;"
-         "ledger ls4: List<Struct2>;"
-         "ledger ls5: List<Vector<3, Struct2>>;"
-         "ledger ls6: List<Vector<0, Struct2>>;"
-         "ledger s1: Set<Boolean>;"
-         "ledger s2: Set<Struct2>;"
-         "ledger mt1: MerkleTree<10, Uint<32>>;"
-         "ledger mt2: MerkleTree<10, Struct2>;"
-         "ledger hmt1: HistoricMerkleTree<10, Uint<32>>;"
-         "ledger hmt2: HistoricMerkleTree<10, Vector<3, Struct2>>;"
-         ))
-     (stage-javascript
-       '(
-         "test('check 1', async () => {"
-         "  const [C, Ctxt] = await startContract(contractCode, {}, 0);"
-         "  const lcl = contractCode.contractReferenceLocations;"
-         "  expect(lcl['tag']).toEqual('publicLedgerArray');"
-         "  expect(lcl['indices']['0']).toEqual(undefined);"
-         "  expect(lcl['indices']['1']['tag']).toEqual('list');"
-         "  expect(lcl['indices']['1']['valueType']['tag']).toEqual('compactValue');"
-         "  expect(lcl['indices']['1']['valueType']['descriptor']).toBeDefined();"
-         "  expect(lcl['indices']['1']['valueType']['sparseType']).toEqual({tag: 'contractAddress'});"
-         "  expect(lcl['indices']['2']['valueType']['sparseType']).toEqual("
-         "                                   {"
-         "                                    tag: 'struct',"
-         "                                    elements: "
-         "                                      { b: { tag: 'contractAddress' } }"
-         "                                   })"
-         "  expect(lcl['indices']['3']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'struct',"
-         "                                elements: "
-         "                                  {"
-         "                                   d: {"
-         "                                       tag: 'struct',"
-         "                                       elements: "
-         "                                         { b: { tag: 'contractAddress' } }"
-         "                                      }"
-         "                                  }"
-         "                               });"
-         "  expect(lcl['indices']['4']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'vector',"
-         "                                sparseType: {"
-         "                                  tag: 'struct',"
-         "                                  elements: "
-         "                                    {"
-         "                                     d: {"
-         "                                         tag: 'struct',"
-         "                                         elements: "
-         "                                           { b: { tag: 'contractAddress' } }"
-         "                                        }"
-         "                                    }"
-         "                                  }"
-         "                               });"
-         "  expect(lcl['indices']['5']).toEqual(undefined);"
-         "  expect(lcl['indices']['6']).toEqual(undefined);"
-         "  expect(lcl['indices']['7']['tag']).toEqual('set');"
-         "  expect(lcl['indices']['7']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'struct',"
-         "                                elements: "
-         "                                  {"
-         "                                   d: {"
-         "                                       tag: 'struct',"
-         "                                       elements: "
-         "                                         { b: { tag: 'contractAddress' } }"
-         "                                      }"
-         "                                  }"
-         "                               });"
-         "  expect(lcl['indices']['8']).toEqual(undefined);"
-         "  expect(lcl['indices']['9']).toEqual(undefined);"
-         "  expect(lcl['indices']['10']).toEqual(undefined);"
-         "  expect(lcl['indices']['11']).toEqual(undefined);"
-         "});"
-         )))
-    )
-
-  (test-group
-    ((create-file "C.compact" '())
-     ; stage C alongside testfile: testfile's generated index.js imports
-     ; '../../C/contract/index.js', so C's compiled artifacts must be copied
-     ; to the test directory.  the empty body just stages without emitting tests.
-     (stage-javascript C '()))
-    ((create-file "testfile.compact"
-       '(
-         "import CompactStandardLibrary;"
-         "contract C {};"
-         "struct Struct1 {"
-         "  a: Field;"
-         "  b: C;"
-         "}"
-         "struct Struct2 {"
-         "  c: Field;"
-         "  d: Struct1;"
-         "}"
-         "ledger f1: Field;"
-         "ledger f2: Field;"
-         "ledger f3: Field;"
-         "ledger f4: Field;"
-         "ledger f5: Field;"
-         "ledger f6: Field;"
-         "ledger f7: Field;"
-         "ledger f8: Field;"
-         "ledger f9: Field;"
-         "ledger f10: List<Struct2>;"
-         "ledger f11: Field;"
-         "ledger f12: Field;"
-         "ledger f13: Field;"
-         "ledger f14: Field;"
-         "ledger f15: Field;"
-         "ledger f16: Field;"
-         "ledger f17: Field;"
-         "ledger f18: Field;"
-         "ledger f19: Field;"
-         "ledger f20: Field;"
-         "ledger f21: Field;"
-         "ledger f22: Field;"
-         "ledger f23: Field;"
-         "ledger f24: Field;"
-         "ledger f25: Field;"
-         "ledger f26: Field;"
-         "ledger f27: Field;"
-         "ledger f28: Field;"
-         "ledger f29: Field;"
-         "ledger f30: Field;"
-         ))
-     (stage-javascript
-       '(
-         "test('check 1', async () => {"
-         "  const [C, Ctxt] = await startContract(contractCode, {}, 0);"
-         "  const lcl = contractCode.contractReferenceLocations;"
-         "  expect(lcl['tag']).toEqual('publicLedgerArray');"
-         "  expect(lcl['indices']['0']['tag']).toEqual('publicLedgerArray');"
-         "  expect(lcl['indices']['0']['indices']['9']['tag']).toEqual('list');"
-         "  expect(lcl['indices']['0']['indices']['9']['valueType']['sparseType']).toEqual("
-         "                               {"
-         "                                tag: 'struct',"
-         "                                elements: "
-         "                                  {"
-         "                                   d: {"
-         "                                       tag: 'struct',"
-         "                                       elements: "
-         "                                         { b: { tag: 'contractAddress' } }"
-         "                                      }"
-         "                                  }"
-         "                               });"
-         "  expect(lcl['indices']['0']['indices']['8']).toEqual(undefined);"
-         "  expect(lcl['indices']['1']).toEqual(undefined);"
-         "  expect(lcl['indices']['2']).toEqual(undefined);"
-         "});"
-         )))
-    )
-
   (test
     '(
       "import CompactStandardLibrary;"
@@ -79329,10 +79433,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -79344,7 +79444,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -86674,10 +86776,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -86689,7 +86787,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -86737,10 +86837,6 @@ groups than for single tests.
         "  readonly F: U32;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -86752,7 +86848,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -86800,10 +86898,6 @@ groups than for single tests.
         "  readonly F: U32;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -86815,7 +86909,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -86860,10 +86956,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -86875,7 +86967,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -86926,10 +87020,6 @@ groups than for single tests.
         "  readonly F: S;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -86941,7 +87031,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -87015,10 +87107,6 @@ groups than for single tests.
         "  readonly F: V3U16;"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -87030,7 +87118,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     (stage-javascript
       '(
         "test('check 1', async () => {"
@@ -88111,10 +88201,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -88126,7 +88212,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     )
 
   (test
@@ -89421,10 +89509,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -89436,7 +89520,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     ; WARNING: Do not replace this wholesale...maintain the structure of the first several
     ; lines to avoid hard-coding a specific runtime version string into the test
     (output-file "compiler/testdir/contract/index.js"
@@ -89522,7 +89608,8 @@ groups than for single tests.
         "          input: { value: [], alignment: [] },"
         "          output: undefined,"
         "          publicTranscript: [],"
-        "          privateTranscriptOutputs: []"
+        "          privateTranscriptOutputs: [],"
+        "          innerProofs: []"
         "        };"
         "        const result_0 = await this._foo_0(context, partialProofData);"
         "        partialProofData.output = { value: [], alignment: [] };"
@@ -89554,12 +89641,13 @@ groups than for single tests.
         "    let stateValue_0 = __compactRuntime.StateValue.newArray();"
         "    state_0.data = new __compactRuntime.ChargedState(stateValue_0);"
         "    state_0.setOperation('foo', new __compactRuntime.ContractOperation());"
-        "    const context = __compactRuntime.createCircuitContext('constructor', __compactRuntime.dummyContractAddress(), constructorContext_0.initialZswapLocalState.coinPublicKey, state_0.data, constructorContext_0.initialPrivateState);"
+        "    const context = __compactRuntime.createCircuitContext({circuitId: 'constructor', contractAddress: __compactRuntime.dummyContractAddress(), coinPublicKeyOrZswapState: constructorContext_0.initialZswapLocalState.coinPublicKey, contractState: state_0.data, privateState: constructorContext_0.initialPrivateState});"
         "    const partialProofData = {"
         "      input: { value: [], alignment: [] },"
         "      output: undefined,"
         "      publicTranscript: [],"
-        "      privateTranscriptOutputs: []"
+        "      privateTranscriptOutputs: [],"
+        "      innerProofs: []"
         "    };"
         "    state_0.data = new __compactRuntime.ChargedState(context.callContext.currentQueryContext.state.state);"
         "    return {"
@@ -89612,7 +89700,8 @@ groups than for single tests.
         "    input: { value: [], alignment: [] },"
         "    output: undefined,"
         "    publicTranscript: [],"
-        "    privateTranscriptOutputs: []"
+        "    privateTranscriptOutputs: [],"
+        "    innerProofs: []"
         "  };"
         "  return {"
         "  };"
@@ -89622,9 +89711,13 @@ groups than for single tests.
         "};"
         "const _dummyContract = new Contract({ bar: (...args) => undefined });"
         "export const pureCircuits = {};"
-        "export const contractReferenceLocations ="
-        "  { tag: 'publicLedgerArray', indices: { } };"
         "export const expectedVk = {};"
+        ""
+        "export const circuitSignatures = {"
+        "  'foo': {pure: false, provable: true, argumentTypes: [], resultType: {tag: 'Tuple', types: []}},"
+        "};"
+        ""
+        "export const declaredInterfaces = {};"
         ""
         "//# sourceMappingURL=index.js.map"))
     )
@@ -91145,10 +91238,6 @@ groups than for single tests.
         "export type Ledger = {"
         "}"
         ""
-        "export type ContractReferenceLocations = any;"
-        ""
-        "export declare const contractReferenceLocations : ContractReferenceLocations;"
-        ""
         "export declare class Contract<PS = any, W extends Witnesses<PS> = Witnesses<PS>> {"
         "  witnesses: W;"
         "  circuits: Circuits<PS>;"
@@ -91160,7 +91249,9 @@ groups than for single tests.
         ""
         "export declare function ledger(state: __compactRuntime.StateValue | __compactRuntime.ChargedState): Ledger;"
         "export declare const pureCircuits: PureCircuits;"
-        "export declare const expectedVk: Record<string, string>;"))
+        "export declare const expectedVk: Record<string, string>;"
+        "export declare const circuitSignatures: __compactRuntime.CircuitSignatures;"
+        "export declare const declaredInterfaces: __compactRuntime.DeclaredInterfaces;"))
     )
 )
 
@@ -92561,6 +92652,232 @@ groups than for single tests.
         "});"
         ))
     )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "export ledger n: Uint<64>;"
+      "witness w(): Field;"
+      "export circuit impureProvable(b: Boolean, f: Field, u: Uint<128>, y: Bytes<32>): [] {"
+      "  n = disclose(1 as Uint<64>);"
+      "}"
+      "export pure circuit pureNotProvable(): Field { return 0 as Field; }"
+      "export circuit witnessOnly(): Field { return disclose(w()); }"
+      "export circuit noArgs(): [] { n = disclose(2 as Uint<64>); }"
+      "circuit helper(): Uint<64> { return 3 as Uint<64>; }"
+      "export circuit usesHelper(): [] { n = disclose(helper()); }"
+      )
+    (stage-javascript
+      '(
+        "test('circuitSignatures covers exactly the exported circuits', () => {"
+        "  const s = contractCode.circuitSignatures;"
+        "  expect(Object.keys(s).sort()).toEqual("
+        "    ['impureProvable', 'noArgs', 'pureNotProvable', 'usesHelper', 'witnessOnly']);"
+        "  expect(s.helper).toBeUndefined();"
+        "});"
+        "test('pure and provable are independent', () => {"
+        "  const s = contractCode.circuitSignatures;"
+        "  expect([s.impureProvable.pure, s.impureProvable.provable]).toEqual([false, true]);"
+        "  expect([s.pureNotProvable.pure, s.pureNotProvable.provable]).toEqual([true, false]);"
+        "  expect([s.witnessOnly.pure, s.witnessOnly.provable]).toEqual([false, false]);"
+        "});"
+        "test('primitive tags and the empty argument list', () => {"
+        "  const s = contractCode.circuitSignatures;"
+        "  expect(s.impureProvable.argumentTypes).toEqual(["
+        "    {tag: 'Boolean'},"
+        "    {tag: 'Field'},"
+        "    {tag: 'Uint', maxval: (2n ** 128n - 1n).toString()},"
+        "    {tag: 'Bytes', length: 32}]);"
+        "  expect(s.noArgs.argumentTypes).toEqual([]);"
+        "  expect(s.noArgs.resultType).toEqual({tag: 'Tuple', types: []});"
+        "});"
+        "test('Uint bounds are exact decimal strings', () => {"
+        "  const u = contractCode.circuitSignatures.impureProvable.argumentTypes[2];"
+        "  if (u.tag !== 'Uint') throw new Error(`expected a Uint, got ${u.tag}`);"
+        "  expect(typeof u.maxval).toEqual('string');"
+        "  expect(u.maxval).toEqual('340282366920938463463374607431768211455');"
+        "});"
+        ))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "export pure circuit curves(a: JubjubScalar,"
+      "                           b: JubjubPoint,"
+      "                           c: Secp256k1Base,"
+      "                           d: Secp256k1Scalar,"
+      "                           e: Secp256k1Point): [] { }"
+      )
+    (stage-javascript curveCode
+      '(
+        "test('curve leaf tags', () => {"
+        "  expect(curveCode.circuitSignatures.curves.argumentTypes).toEqual(["
+        "    {tag: 'JubjubScalar'},"
+        "    {tag: 'JubjubPoint'},"
+        "    {tag: 'Secp256k1Base'},"
+        "    {tag: 'Secp256k1Scalar'},"
+        "    {tag: 'Secp256k1Point'}]);"
+        "});"
+        "test('an absent declaredInterfaces is an empty object', () => {"
+        "  expect(curveCode.declaredInterfaces).toEqual({});"
+        "});"
+        ))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "export struct Inner { f: Field }"
+      "export struct Outer { i: Inner, b: Boolean }"
+      "export enum Color { red, green, blue }"
+      "export new type Nominal = Bytes<8>;"
+      "export type Transparent = Field;"
+      "export pure circuit composites(o: Outer,"
+      "                               c: Color,"
+      "                               nm: Nominal,"
+      "                               tr: Transparent): Inner {"
+      "  return Inner { f: 0 as Field };"
+      "}"
+      "export pure circuit aliasInStruct(v: Vector<2, Nominal>): [] { }"
+      )
+    (stage-javascript structCode
+      '(
+        "test('struct nesting', () => {"
+        "  const s = structCode.circuitSignatures;"
+        "  expect(s.composites.argumentTypes[0]).toEqual({"
+        "    tag: 'Struct', name: 'Outer', elements: ["
+        "      {name: 'i', type: {tag: 'Struct', name: 'Inner',"
+        "                         elements: [{name: 'f', type: {tag: 'Field'}}]}},"
+        "      {name: 'b', type: {tag: 'Boolean'}}]});"
+        "  expect(s.composites.resultType).toEqual({"
+        "    tag: 'Struct', name: 'Inner',"
+        "    elements: [{name: 'f', type: {tag: 'Field'}}]});"
+        "});"
+        "test('enum encoding preserves declaration order', () => {"
+        "  expect(structCode.circuitSignatures.composites.argumentTypes[1]).toEqual({"
+        "    tag: 'Enum', name: 'Color', elements: ['red', 'green', 'blue']});"
+        "});"
+        "test('a nominal alias survives, a transparent one is erased', () => {"
+        "  const s = structCode.circuitSignatures;"
+        "  expect(s.composites.argumentTypes[2]).toEqual({"
+        "    tag: 'Alias', name: 'Nominal', type: {tag: 'Bytes', length: 8}});"
+        "  expect(s.composites.argumentTypes[3]).toEqual({tag: 'Field'});"
+        "});"
+        "test('a nominal alias nests', () => {"
+        "  expect(structCode.circuitSignatures.aliasInStruct.argumentTypes[0]).toEqual({"
+        "    tag: 'Vector', length: 2,"
+        "    type: {tag: 'Alias', name: 'Nominal', type: {tag: 'Bytes', length: 8}}});"
+        "});"
+        ))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "export pure circuit same(v: Vector<3, Field>, t: [Field, Field, Field]): [] { }"
+      "export pure circuit hetero(h: [Field, Boolean]): [] { }"
+      "export pure circuit ones(v: Vector<1, Boolean>, t: [Boolean]): [] { }"
+      "export pure circuit nested(v: Vector<2, Vector<2, Field>>,"
+      "                           t: [[Field, Field], [Field, Field]]): [] { }"
+      "export pure circuit mixed(m: Vector<2, [Field, Boolean]>): [] { }"
+      "export pure circuit zeros(zf: Vector<0, Field>, zb: Vector<0, Boolean>): [] { }"
+      "export pure circuit unit(u: []): [] { }"
+      )
+    (stage-javascript vecCode
+      '(
+        "test('a vector and an equivalent tuple encode alike', () => {"
+        "  const s = vecCode.circuitSignatures;"
+        "  const canonical = {tag: 'Vector', length: 3, type: {tag: 'Field'}};"
+        "  expect(s.same.argumentTypes[0]).toEqual(canonical);"
+        "  expect(s.same.argumentTypes[1]).toEqual(canonical);"
+        "});"
+        "test('a heterogeneous tuple stays a Tuple', () => {"
+        "  expect(vecCode.circuitSignatures.hetero.argumentTypes[0]).toEqual({"
+        "    tag: 'Tuple', types: [{tag: 'Field'}, {tag: 'Boolean'}]});"
+        "});"
+        "test('canonicalization applies at length one', () => {"
+        "  const s = vecCode.circuitSignatures;"
+        "  const canonical = {tag: 'Vector', length: 1, type: {tag: 'Boolean'}};"
+        "  expect(s.ones.argumentTypes[0]).toEqual(canonical);"
+        "  expect(s.ones.argumentTypes[1]).toEqual(canonical);"
+        "});"
+        "test('canonicalization is applied recursively', () => {"
+        "  const s = vecCode.circuitSignatures;"
+        "  const inner = {tag: 'Vector', length: 2, type: {tag: 'Field'}};"
+        "  const outer = {tag: 'Vector', length: 2, type: inner};"
+        "  expect(s.nested.argumentTypes[0]).toEqual(outer);"
+        "  expect(s.nested.argumentTypes[1]).toEqual(outer);"
+        "  expect(s.mixed.argumentTypes[0]).toEqual({"
+        "    tag: 'Vector', length: 2,"
+        "    type: {tag: 'Tuple', types: [{tag: 'Field'}, {tag: 'Boolean'}]}});"
+        "});"
+        "test('zero-length sequences all encode as the empty tuple', () => {"
+        "  const s = vecCode.circuitSignatures;"
+        "  const empty = {tag: 'Tuple', types: []};"
+        "  expect(s.unit.argumentTypes[0]).toEqual(empty);"
+        "  expect(s.zeros.argumentTypes[0]).toEqual(empty);"
+        "  expect(s.zeros.argumentTypes[1]).toEqual(empty);"
+        "});"
+        ))
+    )
+
+  (test
+    '(
+      "import CompactStandardLibrary;"
+      "export pure circuit op(s: Opaque<'string'>): [] { }"
+      )
+    (stage-javascript opaqueCode
+      '(
+        "test('Opaque carries its TypeScript type name', () => {"
+        "  const t = opaqueCode.circuitSignatures.op.argumentTypes[0];"
+        "  if (t.tag !== 'Opaque') throw new Error(`expected an Opaque, got ${t.tag}`);"
+        "  expect(typeof t.tsType).toEqual('string');"
+        "  expect(t.tsType).toContain('string');"
+        "});"
+        ))
+    )
+
+  (test-group
+    ((create-file "Adder.compact"
+       '(
+         "import CompactStandardLibrary;"
+         "export circuit addTo(n: Uint<64>): Uint<64> { return n; }"
+         ))
+     (stage-javascript Adder '()))
+    ((create-file "testfile.compact"
+       '(
+         "import CompactStandardLibrary;"
+         "contract Adder {"
+         "  circuit addTo(n: Uint<64>): Uint<64>;"
+         "  pure circuit peek(): Field;"
+         "}"
+         "ledger a: Adder;"
+         "constructor(x: Adder) { a = disclose(x); }"
+         "export circuit useAdder(): Uint<64> { return a.addTo(1 as Uint<64>); }"
+         "export pure circuit takesAdder(z: Adder): [] { }"
+         ))
+     (stage-javascript
+       '(
+         "test('declaredInterfaces records the contract types called through', () => {"
+         "  const d = contractCode.declaredInterfaces;"
+         "  expect(Object.keys(d)).toEqual(['Adder']);"
+         "  expect(Object.keys(d.Adder).sort()).toEqual(['addTo', 'peek']);"
+         "  expect(d.Adder.addTo.pure).toEqual(false);"
+         "  expect(d.Adder.peek.pure).toEqual(true);"
+         "  const u64 = {tag: 'Uint', maxval: (2n ** 64n - 1n).toString()};"
+         "  expect(d.Adder.addTo.argumentTypes).toEqual([u64]);"
+         "  expect(d.Adder.addTo.resultType).toEqual(u64);"
+         "  expect(d.Adder.peek.argumentTypes).toEqual([]);"
+         "});"
+         "test('a contract type in argument position', () => {"
+         "  const c = contractCode.circuitSignatures.takesAdder.argumentTypes[0];"
+         "  if (c.tag !== 'Contract') throw new Error(`expected a Contract, got ${c.tag}`);"
+         "  expect(c.name).toEqual('Adder');"
+         "  expect(c.circuits).toEqual(contractCode.declaredInterfaces.Adder);"
+         "});"
+         ))))
+
 )
 
 (run-javascript)

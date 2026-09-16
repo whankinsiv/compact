@@ -33,10 +33,15 @@
 //! }
 //! ```
 //!
-//! `vkHash` is sha256 of the decoded `vk`, and is the `VerifyingKeyHash`
-//! constant the Compact contract must name. `instance` is the statement's
-//! public inputs, as decimal field elements in the order the contract passes
-//! them to verifyProof.
+//! Beside it goes `<circuit>.verifier`, the same key as raw bytes, because
+//! `verifyProof` names its key by pathname and reads the file at compile time.
+//!
+//! `vkHash` is sha256 of the decoded `vk`. Note it is *not* the `vk_hash` ZKIR
+//! emits: that one is taken over the `verify_proof_vks` entry, which prefixes
+//! the key with a decider byte. This one identifies the bundle, so a test can
+//! check the `.verifier` the contract names is the key the proof was made
+//! against. `instance` is the statement's public inputs, as decimal field
+//! elements in the order the contract passes them to verifyProof.
 //!
 //! The relations live in `src/proofs/`, one module each, and every one is
 //! rebuilt on each run: they are cheap, and a stale bundle is worse than the
@@ -142,24 +147,20 @@ fn write_bundle(out_file: &Path, circuit: &str, vk_blob: &[u8], proof: &[u8], pi
 
     fs::write(out_file, bundle).expect("write inner proof bundle");
 
+    // The same key again, as bytes rather than base64: `verifyProof` names its
+    // key by pathname and reads the file during macro expansion, so the
+    // compiler needs it on disk. Bare `SerdeFormat::Processed` with no tagged
+    // envelope -- a key from midnight-zk carries no version tag, which is the
+    // case `inner_vk_from_verifier_key` takes untagged.
+    let vk_file = out_file.with_extension("verifier");
+    fs::write(&vk_file, vk_blob).expect("write inner verifying key");
+
     println!("vk hash  : {vk_hash_hex}");
     println!("vk bytes : {}", vk_blob.len());
     println!("proof    : {} bytes", proof.len());
     println!("instance : {} public input(s)", pis.len());
     println!("written  : {}", out_file.display());
-
-    println!("\nCompact VerifyingKeyHash literal:");
-    let literal = vk_hash
-        .chunks(8)
-        .map(|row| {
-            row.iter()
-                .map(|byte| format!("0x{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .collect::<Vec<_>>()
-        .join(",\n                              ");
-    println!("    const vk = Bytes[{literal}]\n                              as VerifyingKeyHash;");
+    println!("key      : {}", vk_file.display());
 }
 
 pub(crate) fn generate<R: Relation + Default>(

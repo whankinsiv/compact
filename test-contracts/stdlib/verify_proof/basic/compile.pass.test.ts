@@ -2,7 +2,7 @@
 // Copyright (C) 2025 Midnight Foundation
 // SPDX-License-Identifier: Apache-2.0
 // Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
+// You may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
 //  	http://www.apache.org/licenses/LICENSE-2.0
@@ -13,8 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { defineCompileTest } from '@test/compact-test';
+import { defineCompileTest, innerProofKeyDir } from '@test/compact-test';
 
+// `--skip-zk` by choice, not by limitation: keygen for a `verifyProof` circuit
+// works, but costs k=19 and a 755 MB proving key, which is not what a compile
+// fixture is checking.
 export default defineCompileTest(import.meta.url, {
-    compilerFlags: ['--feature-zkir-v3', '--skip-zk'],
+    compilerArgs: [
+        '--feature-zkir-v3',
+        '--skip-zk',
+        '--compact-path',
+        innerProofKeyDir,
+    ],
 });

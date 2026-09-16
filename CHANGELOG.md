@@ -5,6 +5,194 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Toolchain 0.34.102, language 0.26.100, runtime 0.19.102]
+
+### Added
+
+- `verifyProof` is implemented for ZKIR 3. A circuit can verify a zero-knowledge
+  proof of a separate statement, naming that statement's verifying key by
+  pathname:
+
+  ```compact
+  verifyProof("inner.verifier", proof, [publicInput])
+  ```
+
+  The key is read at compile time and re-encoded into the form the circuit
+  commits to, so the file must be present whenever the contract is compiled,
+  including under `--skip-zk`. It must be an inner verifying key as midnight-zk
+  writes it; a tagged `.verifier` produced by `compactc` is refused.
+
+  `--feature-zkir-v3` is required. Under ZKIR 2 the compiler now says so, where
+  previously it failed with an internal error.
+
+  The proof supplied must have been produced with a Poseidon transcript, which
+  is what a verifier running inside a circuit can recompute cheaply. ZKIR's own
+  proofs use Blake2b, so a Compact contract's own proof cannot yet serve as the
+  inner proof of another.
+
+  The check performed while the circuit is simulated is necessary but not
+  sufficient: it rejects a malformed proof, a wrong key and a mismatched
+  instance, but stops short of the pairing that decides whether a well-formed
+  proof is true. The ledger settles that.
+
+### Changed
+
+- **Breaking.** `PartialProofData` carries a new required field, `innerProofs`,
+  holding one entry per `inner_proof` instruction in the circuit. Code that
+  constructs a `PartialProofData` by hand must supply it.
+
+- The onchain runtime is now `@midnightntwrk/onchain-runtime-v5` at
+  `5.0.0-alpha.1`, from the ledger's `ledger-10`, which is where the matching
+  `proof-preimage[v2]` serialization tag lives. The ZKIR inputs move with it:
+  v2 to `ledger-10`, v3 to the `midnight-zkir` repository, which is where the
+  `verify_proof` Rust now lives.
+
+### Fixed
+
+- `find-source-pathname` ignored the `extension` argument it declared and always
+  appended `.compact`, so a lookup passing `""` searched for
+  `<name>.verifier.compact`.
+
+- The type checks on `verifyProof`'s public-inputs argument matched only a
+  `Vector<n, Field>` written as such. A vector literal arrives as a tuple, which
+  is the same type, and was rejected.
+
+- Pathnames interpolated into the shell commands that invoke `zkir` and the
+  sha256 helper are now quoted. One containing a single quote produced a shell
+  syntax error rather than a filename.
+
+### Internal notes
+
+- The default `nix develop` shell carries `compactc` and both zkir binaries, so
+  `./compiler/go` runs in it again rather than needing `.#compiler`. The unused
+  `with-zkir` shell is removed.
+
+- `test-center` declares `@midnightntwrk/onchain-runtime-v5` in `nixDependencies`
+  rather than resolving it out of the repo-root `node_modules`, which only some
+  shells refresh.
+
+## [Toolchain 0.34.101, language 0.26.0, runtime 0.19.101]
+
+### Added
+
+- Cross-contract calls now resolve their callee's implementation at run time
+  rather than importing it at compile time.
+  A caller no longer names the module implementing the contract deployed at the
+  call target: the application supplies one, and the runtime checks it against
+  both the caller's contract type and the chain before entering it. Deploying a
+  new implementation at an address no longer means recompiling its callers.
+- Every generated contract module gains two tables:
+  * `declaredInterfaces` — for each contract type the contract calls through,
+    the circuit signatures that type declares. Passed to `crossContractCall` at
+    the call site, because the descriptor lives in the caller's module and the
+    runtime is reached *from* it.
+  * `circuitSignatures` — one entry per external circuit name, carrying `pure`,
+    `provable`, `argumentTypes` and `resultType`. This is the callee side of
+    that comparison.
+    Both appear in the emitted `.d.ts`. The `expectedVk` table is unchanged, 
+    but is now checked past the called circuit — see below.
+- Adds the runtime machinery behind the above. New modules, all re-exported
+  from the package index:
+  * `providers.ts` — `ContractModuleProvider`, a user-supplied
+    `resolve(address)` returning a `ModuleThunk` for the module deployed there,
+    or `undefined` when the application has no binding for it. `resolve` is
+    synchronous and total; loading is deferred into the thunk.
+  * `module.ts` — `Module`, the exports the runtime needs from a callee, plus
+    `ContractCtor`, `ContractInstance`, `ProvableCircuit(s)`, `PureCircuit(s)`.
+  * `interface-descriptor.ts` — `SignatureType`, `InterfaceDescriptor`,
+    `CircuitSignature(s)`, `DeclaredInterfaces` and friends: the type language
+    the two emitted tables are written in.
+  * `conformance.ts` — `checkConformance` and `signatureTypesEqual`, which
+    compare a resolved module's signatures against the caller's contract type
+    under six rules (`Existence`, `Purity`, `Provability`, `Arity`,
+    `ArgumentType`, `ResultType`), plus `UnreadableSignature` for a type
+    constructor this runtime does not know.
+  * `verifier-key-hash.ts` — the branded `VerifierKeyHash` and
+    `isVerifierKeyHash` / `asVerifierKeyHash` / `verifierKeyHashOf`.
+  * `module-resolution.ts` — `ModuleResolutionError`, carrying a
+    `ModuleResolutionFailure` discriminated union with eleven kinds:
+    `ModuleProviderAbsent`, `PureInterfaceCircuit`, `OperationAbsent`,
+    `UnsupportedImplementation`, `ProviderThrew`, `NonconformantImplementation`,
+    `UnreadableModule`, `MalformedVerifierKeyHash`, `ImplementationMismatch`,
+    `ModuleLoadRejected` and `IncompleteModule`. A payload rather than an error
+    subclass, so it survives an application re-throwing through its own error
+    type. The last of these covers a module built before dynamic resolution: the
+    exports resolution reads are checked as the module loads, so a stale
+    artifact names itself instead of failing later as a type error inside
+    conformance checking.
+- Adds `CompactError.is`, which recognizes runtime errors and their subclasses
+  across duplicate installs of the package. A generated contract module resolves
+  its own copy of the runtime, so the copy that throws is not the copy an
+  application catches with, and `instanceof` fails.
+- Key agreement extends past the called circuit: its fingerprint is mandatory
+  and must match, and every other circuit present in both `expectedVk` and the
+  deployed operations must agree. One circuit is too weak a check, since two
+  versions of a contract agree on whatever they did not change; requiring the
+  module's whole set is too strong, since removing an entry point would make the
+  callee unusable for every other circuit.
+
+### Changed
+
+- **Breaking:** `createCircuitContext` takes a single `CircuitContextOptions`
+  object rather than eleven positional parameters. The two providers are grouped
+  under one optional `crossContract` member, so an execution either can make
+  cross-contract calls or cannot, with no half-provisioned combination in
+  between. `parentBlockHash` stays outside the group: it also reaches the VM's
+  block context.
+- **Breaking:** `crossContractCall` takes a `CrossContractCallOptions` object,
+  with two new required fields — `interfaceName` and `declaration`.
+- Conformance is checked before key agreement, so a module that does not
+  implement the contract type is diagnosed as such rather than as a key
+  mismatch.
+
+### Fixed
+
+- A coin commitment created before a cross-contract call is no longer lost when
+  the call returns. `createZswapOutput` recorded the commitment only on the live
+  call context, never on the per-address query-context map, so restoring the
+  caller rewound it and a later `update-with-coin-check` ledger op on that coin
+  failed with "Coin commitment not found". The same write-back also means a
+  second call into a contract resumes from the commitments its first turn made.
+
+### Removed
+
+- **Breaking:** the static dependency crawler, `contract-dependencies.ts`, and
+  its thirteen exports have been removed. These API elements have been used for
+  a while.
+- **Breaking:** generated contract modules no longer export
+  `contractReferenceLocations`, which existed to feed the dependency crawler.
+  It is gone from the emitted `.d.ts` as well.
+- **Breaking:** `ContractInterfaceMismatchError`, replaced by
+  `ModuleResolutionError` with an `ImplementationMismatch` failure.
+- **Breaking:** `reentrancyGuard`, from both `CrossContractInputs` and
+  `CircuitContext`. The guard is unconditional: the ledger can mis-apply a
+  re-entrant transcript, so there is no execution it is correct to skip it for.
+- **Breaking:** `isEncodedContractAddress`, which lost its last caller with the
+  dependency crawler.
+- The compiler no longer emits an import of the callee's module into a caller's
+  generated code, since that is what the provider now supplies.
+
+### Internal notes
+
+- The compiler's `print-contract-header` no longer takes `contract-type*`, and
+  `contract-import-binding`, `contract-import-path`, `get-self-contract-name`
+  and `print-contract-name` went with the callee import.
+- `test-center` gains a `TestChain` that implements `ContractModuleProvider`
+  alongside `ContractStateProvider`, binding each deployed address to its
+  module, plus an `overrideModule` hook so a test can hand the runtime a callee
+  that disagrees with the chain. Verifier keys are installed from one real
+  compiled key with its payload spliced per contract, committed under
+  `test-center/fixtures/verifier-keys/`.
+- `stage-javascript`'s `copy-file` now copies byte-for-byte. It read through a
+  textual port, so Chez transcoded UTF-8 and every invalid byte became U+FFFD —
+  harmless for the `.js` and `.zkir` files it had ever staged, and fatal the
+  first time it staged a `.verifier`.
+- The runtime's `tsconfig` `lib` moves to `es2022` for `Object.hasOwn`, and
+  gains a `typecheck` script that the `test` script runs.
+- `tests-e2e` type-checks for the first time: `moduleResolution` moves to
+  `bundler`, which drops the deprecated `baseUrl` and resolves `vite`'s
+  subpath imports without `skipLibCheck`, plus an explicit `rootDir`.
+
 ## [Toolchain 0.34.100, language 0.26.0, runtime 0.19.100]
 
 ### Fixed

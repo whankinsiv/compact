@@ -23,25 +23,43 @@ import {
     dummyContractAddress,
 } from '@midnight-ntwrk/compact-runtime';
 
-const packageRoot = path.dirname(fileURLToPath(import.meta.url));
+import type {
+    CompactContractConstructor,
+    CompileTestDefinition,
+    CompileTestOptions,
+    InnerProof,
+    ContractCircuitContext,
+    ContractPrivateState,
+    ContractWitnesses,
+    RuntimeTestDefinition,
+    RuntimeTestOptions,
+    TestContract,
+    TestExpectation,
+    TestPhase,
+    TestResult,
+} from './types.ts';
+import { compactTestFilePattern, testRoot } from './utils.ts';
+
 const innerProofOutputDir = path.join(
-    packageRoot,
+    testRoot,
     'tools',
     'verify-proof-fixtures',
     'out',
 );
 
 /**
- * A midnight-zk proof a `verifyProof` fixture verifies, built from the relation
- * of the same name in `tools/verify-proof-fixtures/src/proofs/`.
+ * The directory holding the generated keys, as a `--compact-path` entry.
+ *
+ * `verifyProof` names its key by pathname and the compiler resolves it against
+ * the compact path, so a fixture naming `basic.verifier` needs this on that
+ * path rather than a relative reach out of the fixture directory.
  */
-export type InnerProof = {
-    circuit: string;
-    vkHash: string;
-    vk: Uint8Array;
-    instance: bigint[];
-    proof: Uint8Array;
-};
+export const innerProofKeyDir = innerProofOutputDir;
+
+/** The generated key for one inner circuit, as the contract names it. */
+export function innerProofKeyPath(circuit: string): string {
+    return path.join(innerProofOutputDir, `${circuit}.verifier`);
+}
 
 type InnerProofBundle = {
     circuit: string;
@@ -80,123 +98,15 @@ export function readInnerProof(circuit: string): InnerProof {
     };
 }
 
-type TestPhase = 'compile' | 'runtime';
-export type TestResult = 'pass' | 'fail';
-
-type TestExpectation = {
-    phase: TestPhase;
-    result: TestResult;
-};
-
-export type CompileResult = {
-    contractPath: string;
-    outputDir: string;
-    stderr: string;
-    stdout: string;
-    exitCode: number;
-};
-
-export type CompactContract<PrivateState = any> = {
-    initialState(
-        context: any,
-        ...args: any[]
-    ):
-        | Promise<CompactConstructorResult<PrivateState>>
-        | CompactConstructorResult<PrivateState>;
-};
-
-type CompactConstructorResult<PrivateState = any> = {
-    currentContractState: any;
-    currentPrivateState: PrivateState;
-    currentZswapLocalState: {
-        coinPublicKey: any;
-    };
-};
-
-export type CompactContractConstructor<
-    Contract extends CompactContract<any> = CompactContract<any>,
-    Witnesses = any,
-> = new (witnesses: Witnesses) => Contract;
-
-type ContractConstructorResult<Contract> = Contract extends {
-    initialState(context: any, ...args: any[]): infer Result;
-}
-    ? Awaited<Result>
-    : {
-          currentContractState: any;
-          currentPrivateState: any;
-          currentZswapLocalState: {
-              coinPublicKey: any;
-          };
-      };
-
-type ContractPrivateState<Contract> =
-    ContractConstructorResult<Contract> extends {
-        currentPrivateState: infer PrivateState;
-    }
-        ? PrivateState
-        : any;
-
-type ContractWitnesses<Contract extends CompactContractConstructor> =
-    ConstructorParameters<Contract> extends [infer Witnesses, ...unknown[]]
-        ? Witnesses
-        : never;
-
-type ContractCircuitContextFromCircuits<Circuits> =
-    Circuits[keyof Circuits] extends (
-        context: infer Context,
-        ...args: any[]
-    ) => any
-        ? Context
-        : any;
-
-type ContractCircuitContext<Contract> = Contract extends {
-    circuits: infer Circuits;
-}
-    ? ContractCircuitContextFromCircuits<Circuits>
-    : Contract extends { impureCircuits: infer Circuits }
-      ? ContractCircuitContextFromCircuits<Circuits>
-      : any;
-
-type TestContract<Contract extends CompactContractConstructor> = {
-    contract: InstanceType<Contract>;
-    ctx: ContractCircuitContext<InstanceType<Contract>>;
-};
-
-type ExpectedCompileError = RegExp | ((result: CompileResult) => boolean);
-
-type CompileTestOptions = {
-    expectedError?: ExpectedCompileError;
-    compilerFlags?: string[];
-};
-
-type RuntimeTestOptions = {
-    expectedError?: RegExp | ((error: unknown) => boolean);
-};
-
-export type CompileTestDefinition = {
-    kind: 'compact-compile-test';
-    result: TestResult;
-    options: CompileTestOptions;
-};
-
-export type RuntimeTestDefinition<
-    Contract extends CompactContractConstructor = CompactContractConstructor,
-> = {
-    kind: 'compact-runtime-test';
-    result: TestResult;
-    options: RuntimeTestOptions;
-    run: (Contract: Contract) => Promise<void> | void;
-};
-
-const compactTestFilePattern = /^(compile|runtime)\.(pass|fail)\.test\.ts$/;
-
 /**
  * Defines a compile-phase Compact fixture.
  *
  * The orchestrator imports this metadata before registering Vitest cases. The
  * expected result is read from the file name, so the fixture outcome stays
- * visible in the directory listing.
+ * visible in the directory listing. A fixture that needs a non-default
+ * compiler mode declares the extra flags with `compilerArgs`, which are passed
+ * ahead of the contract and output paths on every compiler invocation for that
+ * fixture.
  */
 export function defineCompileTest(
     metaUrl: string,
@@ -250,13 +160,13 @@ export async function createTestContract<
     const constructorResult = await contract.initialState(
         createConstructorContext(privateState, '0'.repeat(64)),
     );
-    const ctx = createCircuitContext(
-        'constructor',
-        dummyContractAddress(),
-        constructorResult.currentZswapLocalState.coinPublicKey,
-        constructorResult.currentContractState,
-        constructorResult.currentPrivateState,
-    );
+    const ctx = createCircuitContext({
+        circuitId: 'constructor',
+        contractAddress: dummyContractAddress(),
+        coinPublicKeyOrZswapState: constructorResult.currentZswapLocalState.coinPublicKey,
+        contractState: constructorResult.currentContractState,
+        privateState: constructorResult.currentPrivateState,
+    });
 
     return {
         contract,

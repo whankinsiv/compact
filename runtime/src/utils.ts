@@ -13,9 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as ocrt from '@midnightntwrk/onchain-runtime-v4';
+import * as ocrt from '@midnightntwrk/onchain-runtime-v5';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { ContractAddress } from '@midnightntwrk/onchain-runtime-v4';
+import { ContractAddress } from '@midnightntwrk/onchain-runtime-v5';
 import { EncodedContractAddress } from './zswap.js';
 import { CompactError } from './error.js';
 import { CompactType, CompactTypeJubjubPoint, JubjubPoint, Secp256k1Point } from './compact-types.js';
@@ -47,21 +47,9 @@ export function assertIsContractAddress(x: unknown): asserts x is ContractAddres
   }
 }
 
-export function isEncodedContractAddress(x: unknown): x is EncodedContractAddress {
-  return (
-    typeof x === 'object' &&
-    x !== null &&
-    x !== undefined &&
-    'bytes' in x &&
-    x.bytes instanceof Uint8Array &&
-    x.bytes.length == CONTRACT_ADDRESS_BYTE_LENGTH
-  );
-}
-
 export const fromHex = (s: string): Uint8Array => Buffer.from(s, 'hex');
 
 export const toHex = (s: Uint8Array): string => Buffer.from(s).toString('hex');
-
 
 /**
  * Lift the simple affine `Secp256k1Point` representation into a noble-curves
